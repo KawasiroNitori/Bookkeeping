@@ -49,7 +49,8 @@ button:disabled {
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   min-height: 44px;
   padding: 10px 12px;
@@ -61,9 +62,15 @@ select {
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   border-color: #737373;
   box-shadow: 0 0 0 3px rgba(115, 115, 115, 0.12);
+}
+
+textarea {
+  resize: vertical;
+  line-height: 1.45;
 }
 
 #app {
@@ -199,7 +206,7 @@ select:focus {
   top: 0;
   z-index: 20;
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 6px;
   padding: 8px;
   border: 1px solid var(--line);
@@ -597,6 +604,149 @@ select:focus {
   gap: 8px;
 }
 
+.restaurant-layout {
+  display: grid;
+  grid-template-columns: minmax(360px, 1.15fr) minmax(280px, 0.85fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.restaurant-map-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.restaurant-map {
+  width: 100%;
+  min-height: 420px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ecebe4;
+  overflow: hidden;
+}
+
+.restaurant-map.map-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.search-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.restaurant-results {
+  display: grid;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.restaurant-result {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  text-align: left;
+}
+
+.restaurant-result span,
+.selected-restaurant span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.selected-restaurant {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.selected-restaurant a {
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.restaurant-list {
+  display: grid;
+  gap: 10px;
+}
+
+.restaurant-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.restaurant-card.selected {
+  border-color: #111;
+}
+
+.restaurant-card-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
+}
+
+.restaurant-name {
+  font-size: 16px;
+}
+
+.rating-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.review-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.review-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.stars {
+  color: var(--warn);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.review-comment {
+  margin-top: 5px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -617,7 +767,8 @@ select:focus {
   }
 
   .grid.two,
-  .grid.sidebar {
+  .grid.sidebar,
+  .restaurant-layout {
     grid-template-columns: 1fr;
   }
 
@@ -641,5 +792,15 @@ select:focus {
 
   .member-input-row {
     grid-template-columns: auto minmax(66px, 84px) minmax(0, 1fr);
+  }
+
+  .restaurant-map {
+    min-height: 320px;
+  }
+
+  .restaurant-card-head,
+  .review-item,
+  .search-row {
+    grid-template-columns: 1fr;
   }
 }

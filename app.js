@@ -2,6 +2,7 @@
   "use strict";
 
   const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwPzshs-qmMlPCsBIIW6VLUyqgkD3F3nPI96hAm7QbXigVZueCVo4a2wZlXlCwikCg/exec";
+  const KAKAO_JS_KEY = "c7dfd909d0143edbc6e746d79027416d";
   const BASELINE = 50000;
   const THRESHOLD = 20000;
   const CACHE_KEY = "lab-ledger-cache-v2";
@@ -11,6 +12,8 @@
   const state = {
     members: [],
     transactions: [],
+    restaurants: [],
+    reviews: [],
     activeTab: "home",
     status: "loading",
     statusDetail: "구글 시트 확인 중",
@@ -20,6 +23,10 @@
     historyFilter: "all",
     expandedTxnId: "",
     expandedMemberId: "",
+    selectedRestaurantId: "",
+    restaurantSearchResults: [],
+    restaurantMapError: "",
+    reviewStoreStatus: "",
     modal: null,
     saving: false,
   };
@@ -30,6 +37,7 @@
     shared: { memberIds: [], amount: "", memo: "" },
     transfer: { fromMemberId: "", toMemberId: "", amount: "", memo: "" },
     delivery: { memberIds: [], amounts: {}, sharedAmount: "", payerId: "lab", memo: "" },
+    restaurant: { query: "", memberId: "", rating: "5", comment: "" },
     member: { name: "", balance: "50000" },
     editMemberId: "",
     editBalance: "",
@@ -52,6 +60,11 @@
     ["#ede9fe", "#5b21b6"],
     ["#e0f2fe", "#0369a1"],
   ];
+
+  let kakaoLoader = null;
+  let restaurantMap = null;
+  let restaurantMarkers = [];
+  let restaurantInfoWindow = null;
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -110,7 +123,32 @@
       memo: String(txn.memo || ""),
     }));
 
-    return { members, transactions };
+    const restaurants = (data.restaurants || []).map((restaurant) => ({
+      ...restaurant,
+      id: String(restaurant.id || uid()),
+      provider: String(restaurant.provider || "kakao"),
+      providerPlaceId: String(restaurant.providerPlaceId || restaurant.placeId || ""),
+      name: String(restaurant.name || ""),
+      address: String(restaurant.address || ""),
+      lat: Number(restaurant.lat) || 0,
+      lng: Number(restaurant.lng) || 0,
+      phone: String(restaurant.phone || ""),
+      category: String(restaurant.category || ""),
+      placeUrl: String(restaurant.placeUrl || ""),
+      createdAt: restaurant.createdAt || new Date().toISOString(),
+    }));
+
+    const reviews = (data.reviews || []).map((review) => ({
+      ...review,
+      id: String(review.id || uid()),
+      restaurantId: String(review.restaurantId || ""),
+      memberId: String(review.memberId || ""),
+      rating: Math.max(1, Math.min(5, Number(review.rating) || 5)),
+      comment: String(review.comment || ""),
+      createdAt: review.createdAt || new Date().toISOString(),
+    }));
+
+    return { members, transactions, restaurants, reviews };
   }
 
   function saveCache(data) {
@@ -155,9 +193,9 @@
     throw new Error(errors.join(" / "));
   }
 
-  async function saveLedger(members, transactions) {
-    const payload = JSON.stringify({ action: "saveAll", members, transactions });
-    saveCache({ members, transactions });
+  async function saveLedger(members, transactions, restaurants = state.restaurants, reviews = state.reviews) {
+    const payload = JSON.stringify({ action: "saveAll", members, transactions, restaurants, reviews });
+    saveCache({ members, transactions, restaurants, reviews });
 
     if (isLocalHttp()) {
       try {
@@ -188,6 +226,8 @@
     if (cached?.members && cached?.transactions) {
       state.members = cached.members;
       state.transactions = cached.transactions;
+      state.restaurants = cached.restaurants || [];
+      state.reviews = cached.reviews || [];
       state.status = "cached";
       state.statusDetail = "캐시 표시 중";
       state.error = "";
@@ -203,6 +243,8 @@
       const result = await fetchLedger();
       state.members = result.data.members;
       state.transactions = result.data.transactions;
+      state.restaurants = result.data.restaurants.length ? result.data.restaurants : (cached?.restaurants || []);
+      state.reviews = result.data.reviews.length ? result.data.reviews : (cached?.reviews || []);
       state.status = "ok";
       state.statusDetail = result.source === "/api/ledger" ? "로컬 프록시로 연결됨" : "구글 시트 연결됨";
       state.lastSynced = new Date();
@@ -233,6 +275,36 @@
     } catch (error) {
       state.status = "error";
       state.statusDetail = "저장 실패";
+      state.error = error.message || "저장하지 못했습니다.";
+    } finally {
+      state.saving = false;
+      render();
+    }
+  }
+
+  async function applyRestaurantUpdate(restaurants, reviews, afterSuccess) {
+    state.restaurants = restaurants;
+    state.reviews = reviews;
+    state.saving = true;
+    state.status = "saving";
+    state.statusDetail = "저장 중";
+    state.reviewStoreStatus = "식당 리뷰 저장 중";
+    state.error = "";
+    render();
+
+    try {
+      const result = await saveLedger(state.members, state.transactions, restaurants, reviews);
+      afterSuccess?.();
+      state.status = result.verified ? "ok" : "sent";
+      state.statusDetail = result.verified ? "구글 시트에 저장됨" : "저장 요청 전송됨";
+      state.reviewStoreStatus = result.verified
+        ? "식당 리뷰가 저장되었습니다."
+        : "저장 요청을 보냈습니다. Apps Script가 식당/리뷰 시트를 저장하도록 확장되어야 다른 사람에게도 보입니다.";
+      state.lastSynced = new Date();
+    } catch (error) {
+      state.status = "error";
+      state.statusDetail = "저장 실패";
+      state.reviewStoreStatus = "식당 리뷰 저장 실패";
       state.error = error.message || "저장하지 못했습니다.";
     } finally {
       state.saving = false;
@@ -339,12 +411,16 @@
             ["txn", "거래입력"],
             ["history", "거래내역"],
             ["members", "멤버관리"],
+            ["restaurants", "식당 리뷰"],
           ].map(([id, label]) => `<button class="tab ${state.activeTab === id ? "active" : ""}" data-action="tab" data-tab="${id}">${label}</button>`).join("")}
         </nav>
         <main>${renderMain()}</main>
       </div>
       ${renderModal()}
     `;
+    if (state.activeTab === "restaurants") {
+      window.requestAnimationFrame(initRestaurantMap);
+    }
   }
 
   function renderMain() {
@@ -366,6 +442,7 @@
     if (state.activeTab === "txn") return renderTransactionTab();
     if (state.activeTab === "history") return renderHistoryTab();
     if (state.activeTab === "members") return renderMembersTab();
+    if (state.activeTab === "restaurants") return renderRestaurantTab();
     return renderHomeTab();
   }
 
@@ -667,6 +744,355 @@
         </div>
       </div>
     `;
+  }
+
+  function restaurantById() {
+    return Object.fromEntries(state.restaurants.map((restaurant) => [restaurant.id, restaurant]));
+  }
+
+  function reviewsForRestaurant(restaurantId) {
+    return state.reviews
+      .filter((review) => review.restaurantId === restaurantId)
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  }
+
+  function averageRating(restaurantId) {
+    const reviews = reviewsForRestaurant(restaurantId);
+    if (!reviews.length) return 0;
+    return reviews.reduce((sum, review) => sum + Number(review.rating || 0), 0) / reviews.length;
+  }
+
+  function starText(rating) {
+    const rounded = Math.round(Number(rating) || 0);
+    return "★".repeat(rounded) + "☆".repeat(Math.max(0, 5 - rounded));
+  }
+
+  function selectedRestaurant() {
+    return state.restaurants.find((restaurant) => restaurant.id === state.selectedRestaurantId) || null;
+  }
+
+  function renderRestaurantTab() {
+    const selected = selectedRestaurant();
+    const sortedRestaurants = [...state.restaurants].sort((a, b) => {
+      const avgDiff = averageRating(b.id) - averageRating(a.id);
+      if (avgDiff) return avgDiff;
+      return reviewsForRestaurant(b.id).length - reviewsForRestaurant(a.id).length;
+    });
+    const totalReviews = state.reviews.length;
+    const overallAverage = totalReviews
+      ? state.reviews.reduce((sum, review) => sum + Number(review.rating || 0), 0) / totalReviews
+      : 0;
+
+    return `
+      <section class="grid">
+        <div class="grid two">
+          <div class="metric">
+            <div class="metric-label">등록 식당</div>
+            <div class="metric-value">${state.restaurants.length}곳</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">리뷰 평균</div>
+            <div class="metric-value">${totalReviews ? overallAverage.toFixed(1) : "-"}점</div>
+          </div>
+        </div>
+
+        <div class="restaurant-layout">
+          <div class="card restaurant-map-card">
+            <div id="restaurant-map" class="restaurant-map" aria-label="식당 지도"></div>
+            ${state.restaurantMapError ? `<div class="error-box">${escapeHtml(state.restaurantMapError)}</div>` : ""}
+            <div class="note">Kakao 지도에서 식당을 검색하고 마커로 확인할 수 있습니다.</div>
+          </div>
+
+          <form class="form-panel" data-form-root="restaurant">
+            <div class="field">
+              <label for="restaurant-query">식당 검색</label>
+              <div class="search-row">
+                <input id="restaurant-query" type="search" data-form="restaurant" data-field="query" value="${escapeHtml(form.restaurant.query)}" placeholder="식당 이름 또는 장소">
+                <button class="btn" type="button" data-action="restaurant-search" ${state.saving ? "disabled" : ""}>검색</button>
+              </div>
+            </div>
+
+            ${state.restaurantSearchResults.length ? `
+              <div class="field">
+                <div class="field-label">검색 결과</div>
+                <div class="restaurant-results">
+                  ${state.restaurantSearchResults.map((place) => `
+                    <button class="restaurant-result" type="button" data-action="select-restaurant-result" data-place-id="${escapeHtml(place.providerPlaceId)}">
+                      <strong>${escapeHtml(place.name)}</strong>
+                      <span>${escapeHtml(place.address || "주소 정보 없음")}</span>
+                    </button>
+                  `).join("")}
+                </div>
+              </div>
+            ` : ""}
+
+            <div class="field">
+              <div class="field-label">선택한 식당</div>
+              ${selected ? `
+                <div class="selected-restaurant">
+                  <strong>${escapeHtml(selected.name)}</strong>
+                  <span>${escapeHtml(selected.address || "주소 정보 없음")}</span>
+                  ${selected.placeUrl ? `<a href="${escapeHtml(selected.placeUrl)}" target="_blank" rel="noreferrer">카카오맵에서 보기</a>` : ""}
+                </div>
+              ` : `<div class="note">검색 결과나 아래 목록에서 식당을 선택해 주세요.</div>`}
+            </div>
+
+            <div class="field">
+              <label for="review-member">작성자</label>
+              <select id="review-member" data-form="restaurant" data-field="memberId">
+                <option value="">멤버 선택</option>
+                ${state.members.map((member) => `<option value="${member.id}" ${form.restaurant.memberId === member.id ? "selected" : ""}>${escapeHtml(member.name)}</option>`).join("")}
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="review-rating">별점</label>
+              <select id="review-rating" data-form="restaurant" data-field="rating">
+                ${[5, 4, 3, 2, 1].map((rating) => `<option value="${rating}" ${String(form.restaurant.rating) === String(rating) ? "selected" : ""}>${rating}점 ${starText(rating)}</option>`).join("")}
+              </select>
+            </div>
+
+            <div class="field">
+              <label for="review-comment">평가</label>
+              <textarea id="review-comment" data-form="restaurant" data-field="comment" rows="4" placeholder="메뉴, 분위기, 재방문 의사 등을 남겨주세요.">${escapeHtml(form.restaurant.comment)}</textarea>
+            </div>
+
+            ${state.reviewStoreStatus ? `<div class="note">${escapeHtml(state.reviewStoreStatus)}</div>` : ""}
+
+            <button class="btn primary" type="button" data-action="submit-review" ${state.saving ? "disabled" : ""}>
+              ${state.saving ? '<span class="saving-inline"><span class="spinner" aria-hidden="true"></span>저장 중...</span>' : "리뷰 저장"}
+            </button>
+          </form>
+        </div>
+
+        <div>
+          <div class="section-title">식당 목록</div>
+          <div class="restaurant-list">
+            ${sortedRestaurants.length ? sortedRestaurants.map(renderRestaurantCard).join("") : `<div class="empty">등록된 식당 리뷰가 없습니다</div>`}
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderRestaurantCard(restaurant) {
+    const reviews = reviewsForRestaurant(restaurant.id);
+    const avg = averageRating(restaurant.id);
+    const byId = memberById();
+    const selected = state.selectedRestaurantId === restaurant.id;
+
+    return `
+      <article class="card restaurant-card ${selected ? "selected" : ""}">
+        <div class="restaurant-card-head">
+          <div>
+            <div class="row wrap" style="justify-content:flex-start">
+              <strong class="restaurant-name">${escapeHtml(restaurant.name)}</strong>
+              <span class="rating-badge">${reviews.length ? `${avg.toFixed(1)} ${starText(avg)}` : "리뷰 없음"}</span>
+            </div>
+            <div class="note">${escapeHtml(restaurant.address || "주소 정보 없음")}</div>
+          </div>
+          <div class="actions">
+            <button class="btn" type="button" data-action="select-restaurant" data-id="${restaurant.id}">선택</button>
+            ${restaurant.placeUrl ? `<a class="btn" href="${escapeHtml(restaurant.placeUrl)}" target="_blank" rel="noreferrer">지도</a>` : ""}
+          </div>
+        </div>
+        <div class="review-stack">
+          ${reviews.length ? reviews.map((review) => `
+            <div class="review-item">
+              <div>
+                <div class="row wrap" style="justify-content:flex-start">
+                  <strong>${escapeHtml(byId[review.memberId]?.name || "익명")}</strong>
+                  <span class="stars">${starText(review.rating)}</span>
+                  <span class="note">${new Date(review.createdAt).toLocaleDateString("ko-KR", { month: "short", day: "numeric" })}</span>
+                </div>
+                ${review.comment ? `<div class="review-comment">${escapeHtml(review.comment)}</div>` : ""}
+              </div>
+              <button class="btn danger" type="button" data-action="delete-review" data-id="${review.id}" ${state.saving ? "disabled" : ""}>삭제</button>
+            </div>
+          `).join("") : `<div class="note">아직 리뷰가 없습니다.</div>`}
+        </div>
+      </article>
+    `;
+  }
+
+  function loadKakaoMaps() {
+    if (window.kakao?.maps?.services) return Promise.resolve();
+    if (kakaoLoader) return kakaoLoader;
+
+    kakaoLoader = new Promise((resolve, reject) => {
+      const existing = document.querySelector("script[data-kakao-map]");
+      if (existing) {
+        existing.addEventListener("load", () => window.kakao.maps.load(resolve), { once: true });
+        existing.addEventListener("error", reject, { once: true });
+        return;
+      }
+
+      const script = document.createElement("script");
+      script.dataset.kakaoMap = "true";
+      script.src = `https://dapi.kakao.com/v2/maps/sdk.js?appkey=${KAKAO_JS_KEY}&autoload=false&libraries=services`;
+      script.async = true;
+      script.onload = () => window.kakao.maps.load(resolve);
+      script.onerror = () => reject(new Error("Kakao 지도 SDK를 불러오지 못했습니다."));
+      document.head.appendChild(script);
+    });
+
+    return kakaoLoader;
+  }
+
+  async function initRestaurantMap() {
+    if (state.activeTab !== "restaurants") return;
+    const target = document.getElementById("restaurant-map");
+    if (!target) return;
+
+    try {
+      await loadKakaoMaps();
+      if (!restaurantMap || restaurantMap.__target !== target) {
+        const center = new kakao.maps.LatLng(36.3504, 127.3845);
+        restaurantMap = new kakao.maps.Map(target, { center, level: 5 });
+        restaurantMap.__target = target;
+        restaurantInfoWindow = new kakao.maps.InfoWindow({ zIndex: 10 });
+      }
+      state.restaurantMapError = "";
+      renderRestaurantMarkers();
+    } catch (error) {
+      state.restaurantMapError = error.message || "지도를 불러오지 못했습니다.";
+      const message = String(state.restaurantMapError);
+      if (message.includes("등록") || message.includes("domain") || message.includes("도메인")) {
+        state.restaurantMapError += " Kakao Developers의 JavaScript SDK 도메인에는 https://kawasironitori.github.io 도 함께 등록되어 있어야 합니다.";
+      }
+      target.classList.add("map-error");
+      target.textContent = state.restaurantMapError;
+      const box = target.parentElement?.querySelector(".error-box");
+      if (box) box.textContent = state.restaurantMapError;
+    }
+  }
+
+  function renderRestaurantMarkers() {
+    if (!restaurantMap || !window.kakao?.maps) return;
+    restaurantMarkers.forEach((marker) => marker.setMap(null));
+    restaurantMarkers = [];
+
+    const bounds = new kakao.maps.LatLngBounds();
+    const restaurants = state.restaurants.filter((restaurant) => restaurant.lat && restaurant.lng);
+
+    restaurants.forEach((restaurant) => {
+      const position = new kakao.maps.LatLng(restaurant.lat, restaurant.lng);
+      const marker = new kakao.maps.Marker({ map: restaurantMap, position, title: restaurant.name });
+      kakao.maps.event.addListener(marker, "click", () => {
+        state.selectedRestaurantId = restaurant.id;
+        restaurantInfoWindow.setContent(`<div style="padding:8px 10px;font-size:13px;font-weight:700">${escapeHtml(restaurant.name)}</div>`);
+        restaurantInfoWindow.open(restaurantMap, marker);
+        render();
+      });
+      restaurantMarkers.push(marker);
+      bounds.extend(position);
+    });
+
+    if (restaurants.length > 1) {
+      restaurantMap.setBounds(bounds);
+    } else if (restaurants.length === 1) {
+      restaurantMap.setCenter(new kakao.maps.LatLng(restaurants[0].lat, restaurants[0].lng));
+      restaurantMap.setLevel(4);
+    }
+  }
+
+  async function searchRestaurants() {
+    syncInputs();
+    const query = form.restaurant.query.trim();
+    if (!query) return setStatusError("검색할 식당 이름을 입력해 주세요.");
+
+    state.reviewStoreStatus = "식당 검색 중";
+    state.restaurantMapError = "";
+    render();
+
+    try {
+      await loadKakaoMaps();
+      const places = new kakao.maps.services.Places();
+      const results = await new Promise((resolve, reject) => {
+        places.keywordSearch(query, (data, status) => {
+          if (status === kakao.maps.services.Status.OK) return resolve(data);
+          if (status === kakao.maps.services.Status.ZERO_RESULT) return resolve([]);
+          reject(new Error("식당 검색에 실패했습니다."));
+        }, { category_group_code: "FD6" });
+      });
+
+      state.restaurantSearchResults = results.slice(0, 8).map((place) => ({
+        id: `kakao-${place.id}`,
+        provider: "kakao",
+        providerPlaceId: String(place.id),
+        name: place.place_name,
+        address: place.road_address_name || place.address_name || "",
+        lat: Number(place.y) || 0,
+        lng: Number(place.x) || 0,
+        phone: place.phone || "",
+        category: place.category_name || "",
+        placeUrl: place.place_url || "",
+        createdAt: new Date().toISOString(),
+      }));
+      state.reviewStoreStatus = state.restaurantSearchResults.length ? "" : "검색 결과가 없습니다.";
+    } catch (error) {
+      state.restaurantSearchResults = [];
+      state.reviewStoreStatus = "";
+      state.restaurantMapError = error.message || "식당 검색에 실패했습니다.";
+    }
+
+    render();
+  }
+
+  function selectRestaurantCandidate(providerPlaceId) {
+    syncInputs();
+    const candidate = state.restaurantSearchResults.find((place) => place.providerPlaceId === providerPlaceId);
+    if (!candidate) return;
+
+    const existing = state.restaurants.find((restaurant) => restaurant.provider === "kakao" && restaurant.providerPlaceId === providerPlaceId);
+    if (existing) {
+      state.selectedRestaurantId = existing.id;
+    } else {
+      const restaurant = { ...candidate, id: uid() };
+      state.restaurants = [restaurant, ...state.restaurants];
+      state.selectedRestaurantId = restaurant.id;
+      saveCache({
+        members: state.members,
+        transactions: state.transactions,
+        restaurants: state.restaurants,
+        reviews: state.reviews,
+      });
+    }
+    state.reviewStoreStatus = "식당을 선택했습니다. 리뷰를 남기면 저장됩니다.";
+    render();
+  }
+
+  async function submitReview() {
+    syncInputs();
+    const restaurant = selectedRestaurant();
+    if (!restaurant) return setStatusError("리뷰를 남길 식당을 먼저 선택해 주세요.");
+    if (!form.restaurant.memberId) return setStatusError("작성자 멤버를 선택해 주세요.");
+    const rating = Math.max(1, Math.min(5, Number(form.restaurant.rating) || 5));
+    const comment = form.restaurant.comment.trim();
+
+    const restaurants = state.restaurants.some((item) => item.id === restaurant.id)
+      ? state.restaurants
+      : [restaurant, ...state.restaurants];
+    const review = {
+      id: uid(),
+      restaurantId: restaurant.id,
+      memberId: form.restaurant.memberId,
+      rating,
+      comment,
+      createdAt: new Date().toISOString(),
+    };
+
+    await applyRestaurantUpdate(restaurants, [review, ...state.reviews], () => {
+      form.restaurant.comment = "";
+      form.restaurant.rating = "5";
+    });
+  }
+
+  async function deleteReview(reviewId) {
+    const review = state.reviews.find((item) => item.id === reviewId);
+    if (!review) return;
+    if (!window.confirm("이 식당 리뷰를 삭제할까요?")) return;
+    await applyRestaurantUpdate(state.restaurants, state.reviews.filter((item) => item.id !== reviewId));
   }
 
   function renderHistoryTab() {
@@ -1113,6 +1539,18 @@
       return render();
     }
     if (action === "submit-txn") return submitTransaction();
+    if (action === "restaurant-search") return searchRestaurants();
+    if (action === "select-restaurant-result") return selectRestaurantCandidate(button.dataset.placeId);
+    if (action === "select-restaurant") {
+      syncInputs();
+      state.selectedRestaurantId = button.dataset.id;
+      state.reviewStoreStatus = "";
+      return render();
+    }
+    if (action === "submit-review") return submitReview();
+    if (action === "delete-review") {
+      return deleteReview(button.dataset.id);
+    }
     if (action === "history-filter") {
       state.historyFilter = button.dataset.filter;
       return render();
