@@ -6,6 +6,8 @@
   const BASELINE = 50000;
   const THRESHOLD = 20000;
   const CACHE_KEY = "lab-ledger-cache-v2";
+  const REVIEW_TXN_TYPE = "restaurantReview";
+  const REVIEW_TXN_PREFIX = "__restaurant_review__:";
 
   const app = document.getElementById("app");
 
@@ -89,6 +91,126 @@
     return Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   }
 
+  function normalizeRestaurant(restaurant) {
+    return {
+      ...restaurant,
+      id: String(restaurant.id || uid()),
+      provider: String(restaurant.provider || "kakao"),
+      providerPlaceId: String(restaurant.providerPlaceId || restaurant.placeId || ""),
+      name: String(restaurant.name || ""),
+      address: String(restaurant.address || ""),
+      lat: Number(restaurant.lat) || 0,
+      lng: Number(restaurant.lng) || 0,
+      phone: String(restaurant.phone || ""),
+      category: String(restaurant.category || ""),
+      placeUrl: String(restaurant.placeUrl || ""),
+      createdAt: restaurant.createdAt || new Date().toISOString(),
+    };
+  }
+
+  function normalizeReview(review) {
+    return {
+      ...review,
+      id: String(review.id || uid()),
+      restaurantId: String(review.restaurantId || ""),
+      memberId: String(review.memberId || ""),
+      rating: Math.max(1, Math.min(5, Number(review.rating) || 5)),
+      comment: String(review.comment || ""),
+      createdAt: review.createdAt || new Date().toISOString(),
+    };
+  }
+
+  function mergeById(...groups) {
+    const merged = new Map();
+    groups.flat().forEach((item) => {
+      if (!item?.id) return;
+      merged.set(item.id, { ...(merged.get(item.id) || {}), ...item });
+    });
+    return [...merged.values()];
+  }
+
+  function isRestaurantReviewTxn(txn) {
+    return txn?.type === REVIEW_TXN_TYPE || String(txn?.memo || "").startsWith(REVIEW_TXN_PREFIX);
+  }
+
+  function parseRestaurantReviewTxn(txn) {
+    if (!isRestaurantReviewTxn(txn)) return null;
+    const memo = String(txn.memo || "");
+    if (!memo.startsWith(REVIEW_TXN_PREFIX)) return null;
+
+    try {
+      const payload = JSON.parse(memo.slice(REVIEW_TXN_PREFIX.length));
+      const restaurant = normalizeRestaurant(payload.restaurant || {});
+      const review = normalizeReview({
+        ...(payload.review || {}),
+        restaurantId: payload.review?.restaurantId || restaurant.id,
+      });
+      if (!restaurant.id || !review.id || !review.restaurantId) return null;
+      return { restaurant, review };
+    } catch {
+      return null;
+    }
+  }
+
+  function extractRestaurantReviewData(transactions) {
+    const restaurants = [];
+    const reviews = [];
+    transactions.forEach((txn) => {
+      const parsed = parseRestaurantReviewTxn(txn);
+      if (!parsed) return;
+      restaurants.push(parsed.restaurant);
+      reviews.push(parsed.review);
+    });
+    return { restaurants, reviews };
+  }
+
+  function normalizeParticipants(value) {
+    let items = [];
+    if (Array.isArray(value)) {
+      items = value;
+    } else if (typeof value === "string" && value.trim().startsWith("[")) {
+      try {
+        items = JSON.parse(value);
+      } catch {
+        items = [];
+      }
+    }
+    return items.map((part) => ({
+      id: String(part.id),
+      amount: Number(part.amount) || 0,
+    }));
+  }
+
+  function encodeRestaurantReviewTxn(restaurant, review) {
+    const payload = JSON.stringify({ restaurant, review });
+    return {
+      id: `review-${review.id}`,
+      date: review.createdAt || new Date().toISOString(),
+      type: REVIEW_TXN_TYPE,
+      amount: 0,
+      memo: `${REVIEW_TXN_PREFIX}${payload}`,
+      memberId: review.memberId || "",
+      memberIds: "",
+      amountPerPerson: 0,
+      fromMemberId: "",
+      toMemberId: "",
+      payerId: "",
+      sharedAmount: 0,
+      participants: [],
+    };
+  }
+
+  function withRestaurantReviewTransactions(transactions, restaurants, reviews) {
+    const byRestaurantId = Object.fromEntries(restaurants.map((restaurant) => [restaurant.id, restaurant]));
+    const encoded = reviews
+      .map((review) => {
+        const restaurant = byRestaurantId[review.restaurantId];
+        return restaurant ? encodeRestaurantReviewTxn(restaurant, review) : null;
+      })
+      .filter(Boolean);
+    return [...encoded, ...transactions.filter((txn) => !isRestaurantReviewTxn(txn))];
+  }
+
   function isLocalHttp() {
     return location.protocol.startsWith("http") && ["127.0.0.1", "localhost", "::1"].includes(location.hostname);
   }
@@ -116,39 +238,26 @@
       memberIds: Array.isArray(txn.memberIds)
         ? txn.memberIds.map(String)
         : String(txn.memberIds || "").split(",").filter(Boolean),
-      participants: (txn.participants || []).map((part) => ({
-        id: String(part.id),
-        amount: Number(part.amount) || 0,
-      })),
+      participants: normalizeParticipants(txn.participants),
       memo: String(txn.memo || ""),
     }));
 
-    const restaurants = (data.restaurants || []).map((restaurant) => ({
-      ...restaurant,
-      id: String(restaurant.id || uid()),
-      provider: String(restaurant.provider || "kakao"),
-      providerPlaceId: String(restaurant.providerPlaceId || restaurant.placeId || ""),
-      name: String(restaurant.name || ""),
-      address: String(restaurant.address || ""),
-      lat: Number(restaurant.lat) || 0,
-      lng: Number(restaurant.lng) || 0,
-      phone: String(restaurant.phone || ""),
-      category: String(restaurant.category || ""),
-      placeUrl: String(restaurant.placeUrl || ""),
-      createdAt: restaurant.createdAt || new Date().toISOString(),
-    }));
+    const embedded = extractRestaurantReviewData(transactions);
+    const restaurants = mergeById(
+      embedded.restaurants,
+      (data.restaurants || []).map(normalizeRestaurant)
+    );
+    const reviews = mergeById(
+      embedded.reviews,
+      (data.reviews || []).map(normalizeReview)
+    );
 
-    const reviews = (data.reviews || []).map((review) => ({
-      ...review,
-      id: String(review.id || uid()),
-      restaurantId: String(review.restaurantId || ""),
-      memberId: String(review.memberId || ""),
-      rating: Math.max(1, Math.min(5, Number(review.rating) || 5)),
-      comment: String(review.comment || ""),
-      createdAt: review.createdAt || new Date().toISOString(),
-    }));
-
-    return { members, transactions, restaurants, reviews };
+    return {
+      members,
+      transactions: transactions.filter((txn) => !isRestaurantReviewTxn(txn)),
+      restaurants,
+      reviews,
+    };
   }
 
   function saveCache(data) {
@@ -194,7 +303,8 @@
   }
 
   async function saveLedger(members, transactions, restaurants = state.restaurants, reviews = state.reviews) {
-    const payload = JSON.stringify({ action: "saveAll", members, transactions, restaurants, reviews });
+    const storedTransactions = withRestaurantReviewTransactions(transactions, restaurants, reviews);
+    const payload = JSON.stringify({ action: "saveAll", members, transactions: storedTransactions, restaurants, reviews });
     saveCache({ members, transactions, restaurants, reviews });
 
     if (isLocalHttp()) {
@@ -299,7 +409,7 @@
       state.statusDetail = result.verified ? "구글 시트에 저장됨" : "저장 요청 전송됨";
       state.reviewStoreStatus = result.verified
         ? "식당 리뷰가 저장되었습니다."
-        : "저장 요청을 보냈습니다. Apps Script가 식당/리뷰 시트를 저장하도록 확장되어야 다른 사람에게도 보입니다.";
+        : "저장 요청을 보냈습니다. 새로고침 후 다른 기기에서도 같은 리뷰를 볼 수 있습니다.";
       state.lastSynced = new Date();
     } catch (error) {
       state.status = "error";
