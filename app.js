@@ -8,6 +8,8 @@
   const CACHE_KEY = "lab-ledger-cache-v2";
   const REVIEW_TXN_TYPE = "restaurantReview";
   const REVIEW_TXN_PREFIX = "__restaurant_review__:";
+  const REVIEW_TXN_OFFSET_PREFIX = "__restaurant_review_offset__:";
+  const REVIEW_SYNC_AMOUNT = 1;
 
   const app = document.getElementById("app");
 
@@ -29,6 +31,7 @@
     restaurantSearchResults: [],
     restaurantMapError: "",
     reviewStoreStatus: "",
+    reviewsNeedSync: false,
     modal: null,
     saving: false,
   };
@@ -67,6 +70,8 @@
   let restaurantMap = null;
   let restaurantMarkers = [];
   let restaurantInfoWindow = null;
+  let reviewAutoSyncTimer = null;
+  let lastReviewAutoSyncSignature = "";
 
   function escapeHtml(value) {
     return String(value ?? "")
@@ -130,7 +135,10 @@
   }
 
   function isRestaurantReviewTxn(txn) {
-    return txn?.type === REVIEW_TXN_TYPE || String(txn?.memo || "").startsWith(REVIEW_TXN_PREFIX);
+    const memo = String(txn?.memo || "");
+    return txn?.type === REVIEW_TXN_TYPE
+      || memo.startsWith(REVIEW_TXN_PREFIX)
+      || memo.startsWith(REVIEW_TXN_OFFSET_PREFIX);
   }
 
   function parseRestaurantReviewTxn(txn) {
@@ -181,15 +189,12 @@
     }));
   }
 
-  function encodeRestaurantReviewTxn(restaurant, review) {
+  function encodeRestaurantReviewTxns(restaurant, review) {
     const payload = JSON.stringify({ restaurant, review });
-    return {
-      id: `review-${review.id}`,
+    const memberId = review.memberId || state.members[0]?.id || "";
+    const base = {
       date: review.createdAt || new Date().toISOString(),
-      type: REVIEW_TXN_TYPE,
-      amount: 0,
-      memo: `${REVIEW_TXN_PREFIX}${payload}`,
-      memberId: review.memberId || "",
+      memberId,
       memberIds: "",
       amountPerPerson: 0,
       fromMemberId: "",
@@ -198,17 +203,70 @@
       sharedAmount: 0,
       participants: [],
     };
+    return [
+      {
+        ...base,
+        id: `review-${review.id}`,
+        type: "deposit",
+        amount: REVIEW_SYNC_AMOUNT,
+        memo: `${REVIEW_TXN_PREFIX}${payload}`,
+      },
+      {
+        ...base,
+        id: `review-${review.id}-offset`,
+        type: "withdraw",
+        amount: REVIEW_SYNC_AMOUNT,
+        memo: `${REVIEW_TXN_OFFSET_PREFIX}${review.id}`,
+      },
+    ];
   }
 
   function withRestaurantReviewTransactions(transactions, restaurants, reviews) {
     const byRestaurantId = Object.fromEntries(restaurants.map((restaurant) => [restaurant.id, restaurant]));
     const encoded = reviews
-      .map((review) => {
+      .flatMap((review) => {
         const restaurant = byRestaurantId[review.restaurantId];
-        return restaurant ? encodeRestaurantReviewTxn(restaurant, review) : null;
+        return restaurant ? encodeRestaurantReviewTxns(restaurant, review) : [];
       })
       .filter(Boolean);
     return [...encoded, ...transactions.filter((txn) => !isRestaurantReviewTxn(txn))];
+  }
+
+  function restaurantReviewSignature(restaurants = state.restaurants, reviews = state.reviews) {
+    const normalizedRestaurants = restaurants
+      .map((restaurant) => ({
+        id: restaurant.id,
+        providerPlaceId: restaurant.providerPlaceId,
+        name: restaurant.name,
+        address: restaurant.address,
+        lat: restaurant.lat,
+        lng: restaurant.lng,
+        placeUrl: restaurant.placeUrl,
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const normalizedReviews = reviews
+      .map((review) => ({
+        id: review.id,
+        restaurantId: review.restaurantId,
+        memberId: review.memberId,
+        rating: review.rating,
+        comment: review.comment,
+        createdAt: review.createdAt,
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    return JSON.stringify({ restaurants: normalizedRestaurants, reviews: normalizedReviews });
+  }
+
+  function scheduleRestaurantReviewSync() {
+    if (state.activeTab !== "restaurants" || state.saving || !state.reviews.length || !state.reviewsNeedSync) return;
+    const signature = restaurantReviewSignature();
+    if (signature === lastReviewAutoSyncSignature) return;
+    window.clearTimeout(reviewAutoSyncTimer);
+    reviewAutoSyncTimer = window.setTimeout(() => {
+      if (state.activeTab !== "restaurants" || state.saving || !state.reviewsNeedSync) return;
+      lastReviewAutoSyncSignature = signature;
+      applyRestaurantUpdate(state.restaurants, state.reviews);
+    }, 500);
   }
 
   function isLocalHttp() {
@@ -338,6 +396,7 @@
       state.transactions = cached.transactions;
       state.restaurants = cached.restaurants || [];
       state.reviews = cached.reviews || [];
+      state.reviewsNeedSync = false;
       state.status = "cached";
       state.statusDetail = "캐시 표시 중";
       state.error = "";
@@ -351,10 +410,15 @@
 
     try {
       const result = await fetchLedger();
+      const remoteRestaurants = result.data.restaurants;
+      const remoteReviews = result.data.reviews;
+      const cachedRestaurants = cached?.restaurants || [];
+      const cachedReviews = cached?.reviews || [];
       state.members = result.data.members;
       state.transactions = result.data.transactions;
-      state.restaurants = result.data.restaurants.length ? result.data.restaurants : (cached?.restaurants || []);
-      state.reviews = result.data.reviews.length ? result.data.reviews : (cached?.reviews || []);
+      state.restaurants = remoteRestaurants.length ? remoteRestaurants : cachedRestaurants;
+      state.reviews = remoteReviews.length ? remoteReviews : cachedReviews;
+      state.reviewsNeedSync = !remoteReviews.length && cachedReviews.length > 0;
       state.status = "ok";
       state.statusDetail = result.source === "/api/ledger" ? "로컬 프록시로 연결됨" : "구글 시트 연결됨";
       state.lastSynced = new Date();
@@ -411,11 +475,13 @@
         ? "식당 리뷰가 저장되었습니다."
         : "저장 요청을 보냈습니다. 새로고침 후 다른 기기에서도 같은 리뷰를 볼 수 있습니다.";
       state.lastSynced = new Date();
+      state.reviewsNeedSync = false;
     } catch (error) {
       state.status = "error";
       state.statusDetail = "저장 실패";
       state.reviewStoreStatus = "식당 리뷰 저장 실패";
       state.error = error.message || "저장하지 못했습니다.";
+      state.reviewsNeedSync = true;
     } finally {
       state.saving = false;
       render();
@@ -530,6 +596,7 @@
     `;
     if (state.activeTab === "restaurants") {
       window.requestAnimationFrame(initRestaurantMap);
+      window.requestAnimationFrame(scheduleRestaurantReviewSync);
     }
   }
 
@@ -878,12 +945,15 @@
   }
 
   function selectedRestaurant() {
-    return state.restaurants.find((restaurant) => restaurant.id === state.selectedRestaurantId) || null;
+    return state.restaurants.find((restaurant) => restaurant.id === state.selectedRestaurantId)
+      || state.restaurantSearchResults.find((restaurant) => restaurant.id === state.selectedRestaurantId)
+      || null;
   }
 
   function renderRestaurantTab() {
     const selected = selectedRestaurant();
-    const sortedRestaurants = [...state.restaurants].sort((a, b) => {
+    const reviewedRestaurants = state.restaurants.filter((restaurant) => reviewsForRestaurant(restaurant.id).length);
+    const sortedRestaurants = [...reviewedRestaurants].sort((a, b) => {
       const avgDiff = averageRating(b.id) - averageRating(a.id);
       if (avgDiff) return avgDiff;
       return reviewsForRestaurant(b.id).length - reviewsForRestaurant(a.id).length;
@@ -898,7 +968,7 @@
         <div class="grid two">
           <div class="metric">
             <div class="metric-label">등록 식당</div>
-            <div class="metric-value">${state.restaurants.length}곳</div>
+            <div class="metric-value">${reviewedRestaurants.length}곳</div>
           </div>
           <div class="metric">
             <div class="metric-label">리뷰 평균</div>
@@ -969,12 +1039,9 @@
 
             ${state.reviewStoreStatus ? `<div class="note">${escapeHtml(state.reviewStoreStatus)}</div>` : ""}
 
-            <div class="actions">
-              <button class="btn primary" type="button" data-action="submit-review" ${state.saving ? "disabled" : ""}>
-                ${state.saving ? '<span class="saving-inline"><span class="spinner" aria-hidden="true"></span>저장 중...</span>' : "리뷰 저장"}
-              </button>
-              <button class="btn" type="button" data-action="sync-reviews" ${state.saving || !state.reviews.length ? "disabled" : ""}>리뷰 동기화</button>
-            </div>
+            <button class="btn primary" type="button" data-action="submit-review" ${state.saving ? "disabled" : ""}>
+              ${state.saving ? '<span class="saving-inline"><span class="spinner" aria-hidden="true"></span>저장 중...</span>' : "리뷰 저장"}
+            </button>
           </form>
         </div>
 
@@ -1161,15 +1228,7 @@
     if (existing) {
       state.selectedRestaurantId = existing.id;
     } else {
-      const restaurant = { ...candidate, id: uid() };
-      state.restaurants = [restaurant, ...state.restaurants];
-      state.selectedRestaurantId = restaurant.id;
-      saveCache({
-        members: state.members,
-        transactions: state.transactions,
-        restaurants: state.restaurants,
-        reviews: state.reviews,
-      });
+      state.selectedRestaurantId = candidate.id;
     }
     state.reviewStoreStatus = "식당을 선택했습니다. 리뷰를 남기면 저장됩니다.";
     render();
@@ -1206,11 +1265,6 @@
     if (!review) return;
     if (!window.confirm("이 식당 리뷰를 삭제할까요?")) return;
     await applyRestaurantUpdate(state.restaurants, state.reviews.filter((item) => item.id !== reviewId));
-  }
-
-  async function syncRestaurantReviews() {
-    if (!state.reviews.length) return setStatusError("동기화할 리뷰가 없습니다.");
-    await applyRestaurantUpdate(state.restaurants, state.reviews);
   }
 
   function renderHistoryTab() {
@@ -1447,6 +1501,13 @@
     }
   }
 
+  function handleSubmit(event) {
+    const formRoot = event.target.closest("[data-form-root]");
+    if (!formRoot || !app.contains(formRoot)) return;
+    event.preventDefault();
+    if (formRoot.dataset.formRoot === "restaurant") return searchRestaurants();
+  }
+
   function updateSharedHintOnly() {
     const hint = document.getElementById("shared-hint");
     if (!hint) return;
@@ -1666,7 +1727,6 @@
       return render();
     }
     if (action === "submit-review") return submitReview();
-    if (action === "sync-reviews") return syncRestaurantReviews();
     if (action === "delete-review") {
       return deleteReview(button.dataset.id);
     }
@@ -1755,6 +1815,7 @@
 
   app.addEventListener("click", handleClick);
   app.addEventListener("input", handleInput);
+  app.addEventListener("submit", handleSubmit);
 
   loadLedger();
 })();
