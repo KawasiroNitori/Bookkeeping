@@ -969,9 +969,12 @@
 
             ${state.reviewStoreStatus ? `<div class="note">${escapeHtml(state.reviewStoreStatus)}</div>` : ""}
 
-            <button class="btn primary" type="button" data-action="submit-review" ${state.saving ? "disabled" : ""}>
-              ${state.saving ? '<span class="saving-inline"><span class="spinner" aria-hidden="true"></span>저장 중...</span>' : "리뷰 저장"}
-            </button>
+            <div class="actions">
+              <button class="btn primary" type="button" data-action="submit-review" ${state.saving ? "disabled" : ""}>
+                ${state.saving ? '<span class="saving-inline"><span class="spinner" aria-hidden="true"></span>저장 중...</span>' : "리뷰 저장"}
+              </button>
+              <button class="btn" type="button" data-action="sync-reviews" ${state.saving || !state.reviews.length ? "disabled" : ""}>리뷰 동기화</button>
+            </div>
           </form>
         </div>
 
@@ -1203,6 +1206,11 @@
     if (!review) return;
     if (!window.confirm("이 식당 리뷰를 삭제할까요?")) return;
     await applyRestaurantUpdate(state.restaurants, state.reviews.filter((item) => item.id !== reviewId));
+  }
+
+  async function syncRestaurantReviews() {
+    if (!state.reviews.length) return setStatusError("동기화할 리뷰가 없습니다.");
+    await applyRestaurantUpdate(state.restaurants, state.reviews);
   }
 
   function renderHistoryTab() {
@@ -1658,6 +1666,7 @@
       return render();
     }
     if (action === "submit-review") return submitReview();
+    if (action === "sync-reviews") return syncRestaurantReviews();
     if (action === "delete-review") {
       return deleteReview(button.dataset.id);
     }
