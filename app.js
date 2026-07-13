@@ -45,6 +45,20 @@
     member: { name: "", balance: "50000" },
     editMemberId: "",
     editBalance: "",
+    editTxn: {
+      id: "",
+      type: "",
+      date: "",
+      memberId: "",
+      amount: "",
+      memo: "",
+      fromMemberId: "",
+      toMemberId: "",
+      memberIds: [],
+      amounts: {},
+      sharedAmount: "",
+      payerId: "lab",
+    },
   };
 
   const txLabels = {
@@ -1316,6 +1330,7 @@
           <div class="amount" style="color:${info.color}">${escapeHtml(info.amount)}</div>
           <div class="row" style="justify-content:flex-end">
             ${txn.type === "delivery" ? `<button class="btn" data-action="expand-txn" data-id="${txn.id}">${expanded ? "접기" : "자세히"}</button>` : ""}
+            <button class="btn" data-action="edit-txn" data-id="${txn.id}" ${state.saving ? "disabled" : ""}>수정</button>
             <button class="btn danger" data-action="delete-txn" data-id="${txn.id}" ${state.saving ? "disabled" : ""}>삭제</button>
           </div>
         </div>
@@ -1431,9 +1446,183 @@
     `;
   }
 
+  function resetEditTxnForm() {
+    form.editTxn = {
+      id: "",
+      type: "",
+      date: "",
+      memberId: "",
+      amount: "",
+      memo: "",
+      fromMemberId: "",
+      toMemberId: "",
+      memberIds: [],
+      amounts: {},
+      sharedAmount: "",
+      payerId: "lab",
+    };
+  }
+
+  function setEditTxnForm(txn) {
+    form.editTxn = {
+      id: txn.id,
+      type: txn.type,
+      date: txn.date,
+      memberId: txn.memberId || "",
+      amount: String(Math.round(Number(txn.amount) || 0)),
+      memo: txn.memo || "",
+      fromMemberId: txn.fromMemberId || "",
+      toMemberId: txn.toMemberId || "",
+      memberIds: txn.type === "delivery"
+        ? (txn.participants || []).map((part) => part.id)
+        : [...(txn.memberIds || [])],
+      amounts: Object.fromEntries((txn.participants || []).map((part) => [part.id, String(Math.round(Number(part.amount) || 0))])),
+      sharedAmount: String(Math.round(Number(txn.sharedAmount) || 0)),
+      payerId: txn.payerId || "lab",
+    };
+  }
+
+  function editMemberChips({ selected = [], group, disabledId = "" }) {
+    return state.members.map((member) => {
+      const active = selected.includes(member.id);
+      const disabled = disabledId && disabledId === member.id;
+      return `<button class="chip ${active ? "active" : ""}" type="button" data-action="edit-txn-member" data-group="${group}" data-id="${member.id}" ${disabled ? "disabled" : ""}>${escapeHtml(member.name)}</button>`;
+    }).join("");
+  }
+
+  function renderEditTransactionFields() {
+    const current = form.editTxn;
+    if (current.type === "deposit" || current.type === "withdraw") {
+      return `
+        <div class="field">
+          <div class="field-label">대상 멤버</div>
+          <div class="chips">${editMemberChips({ selected: current.memberId ? [current.memberId] : [], group: "member" })}</div>
+        </div>
+        <div class="field">
+          <label for="edit-txn-amount">금액</label>
+          <div class="input-money">
+            <input id="edit-txn-amount" type="number" min="0" inputmode="numeric" data-form="editTxn" data-field="amount" value="${escapeHtml(current.amount)}">
+            <span>원</span>
+          </div>
+        </div>
+      `;
+    }
+
+    if (current.type === "transfer") {
+      return `
+        <div class="field">
+          <div class="field-label">보내는 사람</div>
+          <div class="chips">${editMemberChips({ selected: current.fromMemberId ? [current.fromMemberId] : [], group: "transfer-from" })}</div>
+        </div>
+        <div class="field">
+          <div class="field-label">받는 사람</div>
+          <div class="chips">${editMemberChips({ selected: current.toMemberId ? [current.toMemberId] : [], group: "transfer-to", disabledId: current.fromMemberId })}</div>
+        </div>
+        <div class="field">
+          <label for="edit-txn-amount">금액</label>
+          <div class="input-money">
+            <input id="edit-txn-amount" type="number" min="0" inputmode="numeric" data-form="editTxn" data-field="amount" value="${escapeHtml(current.amount)}">
+            <span>원</span>
+          </div>
+        </div>
+      `;
+    }
+
+    if (current.type === "shared") {
+      return `
+        <div class="field">
+          <div class="field-label">참여 멤버</div>
+          <div class="chips">${editMemberChips({ selected: current.memberIds, group: "shared" })}</div>
+        </div>
+        <div class="field">
+          <label for="edit-txn-amount">금액</label>
+          <div class="input-money">
+            <input id="edit-txn-amount" type="number" min="0" inputmode="numeric" data-form="editTxn" data-field="amount" value="${escapeHtml(current.amount)}">
+            <span>원</span>
+          </div>
+          <div class="note">선택된 멤버 ${current.memberIds.length || state.members.length}명에게 나누어 반영됩니다.</div>
+        </div>
+      `;
+    }
+
+    if (current.type === "delivery") {
+      const selectedMembers = current.memberIds.map((id) => state.members.find((member) => member.id === id)).filter(Boolean);
+      const sharedAmount = parseMoney(current.sharedAmount);
+      const itemTotal = selectedMembers.reduce((sum, member) => sum + parseMoney(current.amounts[member.id]), 0);
+      return `
+        <div class="field">
+          <div class="field-label">참여 멤버</div>
+          <div class="chips">${editMemberChips({ selected: current.memberIds, group: "delivery" })}</div>
+        </div>
+        ${selectedMembers.length ? `
+          <div class="field">
+            <div class="field-label">개인 금액</div>
+            <div class="mini-grid">
+              ${selectedMembers.map((member) => `
+                <div class="member-input-row">
+                  ${avatar(member.name, 30)}
+                  <strong>${escapeHtml(member.name)}</strong>
+                  <div class="input-money">
+                    <input type="number" min="0" inputmode="numeric" data-form="editTxn" data-field="amounts" data-id="${member.id}" value="${escapeHtml(current.amounts[member.id] || "")}" placeholder="0">
+                    <span>원</span>
+                  </div>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        ` : ""}
+        <div class="field">
+          <label for="edit-txn-shared">공동 금액</label>
+          <div class="input-money">
+            <input id="edit-txn-shared" type="number" min="0" inputmode="numeric" data-form="editTxn" data-field="sharedAmount" value="${escapeHtml(current.sharedAmount)}">
+            <span>원</span>
+          </div>
+          <div class="note">합계 ${fmt(itemTotal + sharedAmount)}원</div>
+        </div>
+        <div class="field">
+          <div class="field-label">결제자</div>
+          <div class="chips">
+            <button class="chip ${current.payerId === "lab" ? "active" : ""}" type="button" data-action="edit-txn-payer" data-id="lab">랩비카드</button>
+            ${selectedMembers.map((member) => `<button class="chip ${current.payerId === member.id ? "active" : ""}" type="button" data-action="edit-txn-payer" data-id="${member.id}">${escapeHtml(member.name)}</button>`).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    return `<div class="note">수정할 수 없는 거래 형식입니다.</div>`;
+  }
+
+  function renderEditTransactionModal(txn) {
+    if (!txn) return "";
+    const typeLabel = txLabels[form.editTxn.type] || "거래";
+    return `
+      <div class="modal-backdrop" role="presentation">
+        <div class="modal edit-modal" role="dialog" aria-modal="true">
+          <h2>${escapeHtml(typeLabel)} 수정</h2>
+          <form class="edit-transaction-form" data-form-root="edit-txn">
+            ${renderEditTransactionFields()}
+            <div class="field">
+              <label for="edit-txn-memo">메모</label>
+              <input id="edit-txn-memo" type="text" data-form="editTxn" data-field="memo" value="${escapeHtml(form.editTxn.memo)}" placeholder="내용을 입력하세요">
+            </div>
+            <div class="modal-actions">
+              <button class="btn" type="button" data-action="modal-cancel">취소</button>
+              <button class="btn primary" type="button" data-action="save-txn-edit" ${state.saving ? "disabled" : ""}>
+                ${state.saving ? '<span class="saving-inline"><span class="spinner" aria-hidden="true"></span>저장 중...</span>' : "저장"}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `;
+  }
+
   function renderModal() {
     if (!state.modal) return "";
     const { type, id } = state.modal;
+    if (type === "editTxn") {
+      return renderEditTransactionModal(state.transactions.find((txn) => txn.id === id));
+    }
     const isTxn = type === "deleteTxn";
     const target = isTxn ? state.transactions.find((txn) => txn.id === id) : state.members.find((member) => member.id === id);
     const message = isTxn
@@ -1460,6 +1649,8 @@
       const field = input.dataset.field;
       if (formName === "delivery" && field === "amounts") {
         form.delivery.amounts[input.dataset.id] = input.value;
+      } else if (formName === "editTxn" && field === "amounts") {
+        form.editTxn.amounts[input.dataset.id] = input.value;
       } else if (formName === "edit") {
         form.editBalance = input.value;
       } else if (form[formName]) {
@@ -1476,6 +1667,8 @@
     if (formName === "delivery" && field === "amounts") {
       form.delivery.amounts[input.dataset.id] = input.value;
       updateDeliveryPreviewOnly();
+    } else if (formName === "editTxn" && field === "amounts") {
+      form.editTxn.amounts[input.dataset.id] = input.value;
     } else if (formName === "edit") {
       form.editBalance = input.value;
     } else if (form[formName]) {
@@ -1493,6 +1686,7 @@
     if (!formRoot || !app.contains(formRoot)) return;
     event.preventDefault();
     if (formRoot.dataset.formRoot === "restaurant") return searchRestaurants();
+    if (formRoot.dataset.formRoot === "edit-txn") return saveTransactionEdit();
   }
 
   function updateSharedHintOnly() {
@@ -1651,8 +1845,123 @@
     });
   }
 
+  function changeTotalsByMember(txn) {
+    const totals = new Map();
+    computeChanges(txn).forEach((change) => {
+      if (!change.memberId) return;
+      totals.set(change.memberId, (totals.get(change.memberId) || 0) + change.delta);
+    });
+    return totals;
+  }
+
+  function buildEditedTransaction(original) {
+    const current = form.editTxn;
+    const type = original.type;
+    const base = {
+      ...original,
+      type,
+      memo: current.memo,
+      memberId: "",
+      memberIds: [],
+      amountPerPerson: 0,
+      fromMemberId: "",
+      toMemberId: "",
+      payerId: "",
+      sharedAmount: 0,
+      participants: [],
+    };
+
+    if (type === "deposit" || type === "withdraw") {
+      const amount = parseMoney(current.amount);
+      if (!current.memberId || amount <= 0) return setStatusError("대상 멤버와 금액을 확인해 주세요.");
+      return { ...base, amount, memberId: current.memberId };
+    }
+
+    if (type === "shared") {
+      const amount = parseMoney(current.amount);
+      if (amount <= 0) return setStatusError("공동지출 금액을 확인해 주세요.");
+      const ids = current.memberIds.length ? current.memberIds : state.members.map((member) => member.id);
+      if (!ids.length) return setStatusError("공동지출을 나눌 멤버가 없습니다.");
+      return { ...base, amount, memberIds: ids, amountPerPerson: amount / ids.length };
+    }
+
+    if (type === "transfer") {
+      const amount = parseMoney(current.amount);
+      if (!current.fromMemberId || !current.toMemberId || current.fromMemberId === current.toMemberId || amount <= 0) {
+        return setStatusError("보내는 사람, 받는 사람, 금액을 확인해 주세요.");
+      }
+      return { ...base, amount, fromMemberId: current.fromMemberId, toMemberId: current.toMemberId };
+    }
+
+    if (type === "delivery") {
+      const sharedAmount = parseMoney(current.sharedAmount);
+      const participants = current.memberIds.map((id) => ({ id, amount: parseMoney(current.amounts[id]) }));
+      const total = participants.reduce((sum, part) => sum + part.amount, 0) + sharedAmount;
+      if (!participants.length || total <= 0) return setStatusError("배달정산 참여 멤버와 금액을 확인해 주세요.");
+      const payerId = current.payerId && (current.payerId === "lab" || current.memberIds.includes(current.payerId))
+        ? current.payerId
+        : "lab";
+      return { ...base, amount: total, payerId, sharedAmount, participants };
+    }
+
+    return null;
+  }
+
+  async function saveTransactionEdit() {
+    syncInputs();
+    const original = state.transactions.find((txn) => txn.id === form.editTxn.id);
+    if (!original) return setStatusError("수정할 거래를 찾지 못했습니다.");
+    const edited = buildEditedTransaction(original);
+    if (!edited) return;
+
+    const oldTotals = changeTotalsByMember(original);
+    const newTotals = changeTotalsByMember(edited);
+    const members = state.members.map((member) => {
+      const delta = (newTotals.get(member.id) || 0) - (oldTotals.get(member.id) || 0);
+      return delta ? { ...member, balance: member.balance + delta } : member;
+    });
+    const transactions = state.transactions.map((txn) => txn.id === original.id ? edited : txn);
+
+    await applyUpdate(members, transactions, () => {
+      state.modal = null;
+      resetEditTxnForm();
+    });
+  }
+
   function toggleArrayValue(values, value) {
     return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
+  }
+
+  function startTransactionEdit(id) {
+    const txn = state.transactions.find((item) => item.id === id);
+    if (!txn) return;
+    setEditTxnForm(txn);
+    state.modal = { type: "editTxn", id };
+    state.error = "";
+    render();
+  }
+
+  function updateEditTxnMember(button) {
+    syncInputs();
+    const id = button.dataset.id;
+    const group = button.dataset.group;
+
+    if (group === "member") {
+      form.editTxn.memberId = id;
+    } else if (group === "transfer-from") {
+      form.editTxn.fromMemberId = id;
+      if (form.editTxn.toMemberId === id) form.editTxn.toMemberId = "";
+    } else if (group === "transfer-to") {
+      if (form.editTxn.fromMemberId !== id) form.editTxn.toMemberId = id;
+    } else if (group === "shared") {
+      form.editTxn.memberIds = toggleArrayValue(form.editTxn.memberIds, id);
+    } else if (group === "delivery") {
+      form.editTxn.memberIds = toggleArrayValue(form.editTxn.memberIds, id);
+      if (!form.editTxn.memberIds.includes(id)) delete form.editTxn.amounts[id];
+      if (!form.editTxn.memberIds.includes(form.editTxn.payerId)) form.editTxn.payerId = "lab";
+    }
+
+    render();
   }
 
   function handleClick(event) {
@@ -1704,7 +2013,15 @@
       form.delivery.payerId = button.dataset.id;
       return render();
     }
+    if (action === "edit-txn-member") return updateEditTxnMember(button);
+    if (action === "edit-txn-payer") {
+      syncInputs();
+      form.editTxn.payerId = button.dataset.id;
+      return render();
+    }
     if (action === "submit-txn") return submitTransaction();
+    if (action === "edit-txn") return startTransactionEdit(button.dataset.id);
+    if (action === "save-txn-edit") return saveTransactionEdit();
     if (action === "restaurant-search") return searchRestaurants();
     if (action === "select-restaurant-result") return selectRestaurantCandidate(button.dataset.placeId);
     if (action === "select-restaurant") {
@@ -1751,6 +2068,7 @@
     }
     if (action === "add-member") return addMember();
     if (action === "modal-cancel") {
+      if (state.modal?.type === "editTxn") resetEditTxnForm();
       state.modal = null;
       return render();
     }

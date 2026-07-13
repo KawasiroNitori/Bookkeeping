@@ -571,6 +571,12 @@ textarea {
   box-shadow: 0 24px 70px rgba(0, 0, 0, 0.24);
 }
 
+.modal.edit-modal {
+  width: min(680px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
+}
+
 .modal h2 {
   margin: 0 0 8px;
   font-size: 18px;
