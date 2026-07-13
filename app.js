@@ -9,7 +9,6 @@
   const REVIEW_TXN_TYPE = "restaurantReview";
   const REVIEW_TXN_PREFIX = "__restaurant_review__:";
   const REVIEW_TXN_OFFSET_PREFIX = "__restaurant_review_offset__:";
-  const REVIEW_SYNC_AMOUNT = 1;
 
   const app = document.getElementById("app");
 
@@ -136,6 +135,7 @@
 
   function isRestaurantReviewTxn(txn) {
     const memo = String(txn?.memo || "");
+    // Keep filtering legacy review rows that were briefly stored as deposit/withdraw pairs.
     return txn?.type === REVIEW_TXN_TYPE
       || memo.startsWith(REVIEW_TXN_PREFIX)
       || memo.startsWith(REVIEW_TXN_OFFSET_PREFIX);
@@ -189,12 +189,15 @@
     }));
   }
 
-  function encodeRestaurantReviewTxns(restaurant, review) {
+  function encodeRestaurantReviewTxn(restaurant, review) {
     const payload = JSON.stringify({ restaurant, review });
-    const memberId = review.memberId || state.members[0]?.id || "";
-    const base = {
+    return {
+      id: `review-${review.id}`,
       date: review.createdAt || new Date().toISOString(),
-      memberId,
+      type: REVIEW_TXN_TYPE,
+      amount: 0,
+      memo: `${REVIEW_TXN_PREFIX}${payload}`,
+      memberId: review.memberId || "",
       memberIds: "",
       amountPerPerson: 0,
       fromMemberId: "",
@@ -203,30 +206,14 @@
       sharedAmount: 0,
       participants: [],
     };
-    return [
-      {
-        ...base,
-        id: `review-${review.id}`,
-        type: "deposit",
-        amount: REVIEW_SYNC_AMOUNT,
-        memo: `${REVIEW_TXN_PREFIX}${payload}`,
-      },
-      {
-        ...base,
-        id: `review-${review.id}-offset`,
-        type: "withdraw",
-        amount: REVIEW_SYNC_AMOUNT,
-        memo: `${REVIEW_TXN_OFFSET_PREFIX}${review.id}`,
-      },
-    ];
   }
 
   function withRestaurantReviewTransactions(transactions, restaurants, reviews) {
     const byRestaurantId = Object.fromEntries(restaurants.map((restaurant) => [restaurant.id, restaurant]));
     const encoded = reviews
-      .flatMap((review) => {
+      .map((review) => {
         const restaurant = byRestaurantId[review.restaurantId];
-        return restaurant ? encodeRestaurantReviewTxns(restaurant, review) : [];
+        return restaurant ? encodeRestaurantReviewTxn(restaurant, review) : null;
       })
       .filter(Boolean);
     return [...encoded, ...transactions.filter((txn) => !isRestaurantReviewTxn(txn))];
