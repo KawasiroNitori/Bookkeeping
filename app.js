@@ -611,6 +611,7 @@
             </div>
           </div>
           <div class="actions">
+            ${state.transactions.length ? `<button class="btn" data-action="download-cache" ${state.saving ? "disabled" : ""}>캐시 백업 다운로드</button>` : ""}
             ${state.canRestoreFromCache ? `<button class="btn primary" data-action="restore-cache" ${state.saving ? "disabled" : ""}>캐시 거래내역 복구</button>` : ""}
             <button class="btn" data-action="refresh" ${state.saving ? "disabled" : ""}>새로고침</button>
           </div>
@@ -1968,6 +1969,30 @@
     await applyUpdate(state.members, state.transactions);
   }
 
+  function downloadCacheBackup() {
+    if (!state.transactions.length) return setStatusError("백업할 거래내역이 없습니다.");
+    const cached = readCache();
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      source: "lab-ledger-browser-cache",
+      cacheSavedAt: cached?.savedAt || "",
+      members: state.members,
+      transactions: state.transactions,
+      restaurants: state.restaurants,
+      reviews: state.reviews,
+    };
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `lab-ledger-cache-backup-${stamp}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
   function toggleArrayValue(values, value) {
     return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
   }
@@ -2011,6 +2036,7 @@
     event.preventDefault();
 
     if (action === "refresh") return loadLedger();
+    if (action === "download-cache") return downloadCacheBackup();
     if (action === "restore-cache") return restoreCachedTransactions();
     if (action === "tab") {
       syncInputs();
