@@ -31,6 +31,8 @@
     restaurantMapError: "",
     reviewStoreStatus: "",
     reviewsNeedSync: false,
+    remoteLedgerMissing: false,
+    canRestoreFromCache: false,
     modal: null,
     saving: false,
   };
@@ -311,11 +313,16 @@
       (data.reviews || []).map(normalizeReview)
     );
 
+    const ledgerTransactions = transactions.filter((txn) => !isRestaurantReviewTxn(txn));
+    const reviewTransactions = transactions.filter(isRestaurantReviewTxn);
+
     return {
       members,
-      transactions: transactions.filter((txn) => !isRestaurantReviewTxn(txn)),
+      transactions: ledgerTransactions,
       restaurants,
       reviews,
+      sourceTransactionCount: transactions.length,
+      sourceReviewTransactionCount: reviewTransactions.length,
     };
   }
 
@@ -351,7 +358,6 @@
     for (const source of sources) {
       try {
         const data = parseSheet(await fetchJson(source));
-        saveCache(data);
         return { data, source };
       } catch (error) {
         errors.push(`${source}: ${error.message || error}`);
@@ -362,6 +368,9 @@
   }
 
   async function saveLedger(members, transactions, restaurants = state.restaurants, reviews = state.reviews) {
+    if (state.remoteLedgerMissing && !state.canRestoreFromCache) {
+      throw new Error("구글 시트 거래 기록이 리뷰 데이터만 남은 상태라 저장을 중단했습니다. 먼저 구글 시트 버전 기록이나 다른 브라우저 캐시로 복구해 주세요.");
+    }
     const storedTransactions = withRestaurantReviewTransactions(transactions, restaurants, reviews);
     const payload = JSON.stringify({ action: "saveAll", members, transactions: storedTransactions, restaurants, reviews });
     saveCache({ members, transactions, restaurants, reviews });
@@ -415,15 +424,35 @@
       const remoteReviews = result.data.reviews;
       const cachedRestaurants = cached?.restaurants || [];
       const cachedReviews = cached?.reviews || [];
+      const cachedTransactions = cached?.transactions || [];
+      const remoteHasOnlyReviewRows = result.data.sourceTransactionCount > 0
+        && result.data.sourceTransactionCount === result.data.sourceReviewTransactionCount
+        && remoteReviews.length > 0;
       state.members = result.data.members;
-      state.transactions = result.data.transactions;
+      state.transactions = remoteHasOnlyReviewRows && cachedTransactions.length
+        ? cachedTransactions
+        : result.data.transactions;
       state.restaurants = remoteRestaurants.length ? remoteRestaurants : cachedRestaurants;
       state.reviews = remoteReviews.length ? remoteReviews : cachedReviews;
       state.reviewsNeedSync = !remoteReviews.length && cachedReviews.length > 0;
+      state.remoteLedgerMissing = remoteHasOnlyReviewRows;
+      state.canRestoreFromCache = remoteHasOnlyReviewRows && cachedTransactions.length > 0;
       state.status = "ok";
       state.statusDetail = result.source === "/api/ledger" ? "로컬 프록시로 연결됨" : "구글 시트 연결됨";
       state.lastSynced = new Date();
-      state.error = "";
+      state.error = remoteHasOnlyReviewRows
+        ? cachedTransactions.length
+          ? "구글 시트 거래 기록이 식당 리뷰 행만 반환되어, 이 브라우저에 남은 캐시 거래내역을 표시 중입니다. 캐시 거래내역 복구 버튼으로 구글 시트에 되돌릴 수 있습니다."
+          : "구글 시트 거래 기록이 식당 리뷰 행만 남은 상태입니다. 저장을 잠시 막았습니다. 구글 시트 버전 기록이나 예전 캐시가 남아 있는 다른 브라우저에서 복구가 필요합니다."
+        : "";
+      if (!remoteHasOnlyReviewRows || cachedTransactions.length) {
+        saveCache({
+          members: state.members,
+          transactions: state.transactions,
+          restaurants: state.restaurants,
+          reviews: state.reviews,
+        });
+      }
     } catch (error) {
       state.status = cached ? "cached" : "error";
       state.statusDetail = cached ? "캐시 표시 중" : "연결 실패";
@@ -447,6 +476,8 @@
       state.status = result.verified ? "ok" : "sent";
       state.statusDetail = result.verified ? "구글 시트에 저장됨" : "저장 요청 전송됨";
       state.lastSynced = new Date();
+      state.remoteLedgerMissing = false;
+      state.canRestoreFromCache = false;
     } catch (error) {
       state.status = "error";
       state.statusDetail = "저장 실패";
@@ -477,6 +508,8 @@
         : "저장 요청을 보냈습니다. 새로고침 후 다른 기기에서도 같은 리뷰를 볼 수 있습니다.";
       state.lastSynced = new Date();
       state.reviewsNeedSync = false;
+      state.remoteLedgerMissing = false;
+      state.canRestoreFromCache = false;
     } catch (error) {
       state.status = "error";
       state.statusDetail = "저장 실패";
@@ -578,6 +611,7 @@
             </div>
           </div>
           <div class="actions">
+            ${state.canRestoreFromCache ? `<button class="btn primary" data-action="restore-cache" ${state.saving ? "disabled" : ""}>캐시 거래내역 복구</button>` : ""}
             <button class="btn" data-action="refresh" ${state.saving ? "disabled" : ""}>새로고침</button>
           </div>
         </header>
@@ -1928,6 +1962,12 @@
     });
   }
 
+  async function restoreCachedTransactions() {
+    if (!state.canRestoreFromCache || !state.transactions.length) return setStatusError("복구할 캐시 거래내역이 없습니다.");
+    if (!window.confirm("이 브라우저에 남아 있는 캐시 거래내역으로 구글 시트를 복구할까요?")) return;
+    await applyUpdate(state.members, state.transactions);
+  }
+
   function toggleArrayValue(values, value) {
     return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
   }
@@ -1971,6 +2011,7 @@
     event.preventDefault();
 
     if (action === "refresh") return loadLedger();
+    if (action === "restore-cache") return restoreCachedTransactions();
     if (action === "tab") {
       syncInputs();
       state.activeTab = button.dataset.tab;
