@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwPzshs-qmMlPCsBIIW6VLUyqgkD3F3nPI96hAm7QbXigVZueCVo4a2wZlXlCwikCg/exec";
+  const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbx31JEaYLjq3feff6x-TRUGSQnjIYiLP5HeVM1cMzt_i6dL7yoQQQ49GiSFw7881onC/exec";
   const KAKAO_JS_KEY = "c7dfd909d0143edbc6e746d79027416d";
   const BASELINE = 50000;
   const THRESHOLD = 20000;
