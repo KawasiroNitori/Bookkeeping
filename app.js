@@ -9,6 +9,15 @@
   const REVIEW_TXN_TYPE = "restaurantReview";
   const REVIEW_TXN_PREFIX = "__restaurant_review__:";
   const REVIEW_TXN_OFFSET_PREFIX = "__restaurant_review_offset__:";
+  const MUTATION_ACTIONS = new Set([
+    "appendTransaction",
+    "appendTransactions",
+    "updateTransaction",
+    "deleteTransaction",
+    "addMember",
+    "updateMember",
+    "deleteMember",
+  ]);
 
   const app = document.getElementById("app");
 
@@ -33,6 +42,7 @@
     reviewsNeedSync: false,
     remoteLedgerMissing: false,
     canRestoreFromCache: false,
+    backendSupportsMutations: false,
     modal: null,
     saving: false,
   };
@@ -268,7 +278,19 @@
     reviewAutoSyncTimer = window.setTimeout(() => {
       if (state.activeTab !== "restaurants" || state.saving || !state.reviewsNeedSync) return;
       lastReviewAutoSyncSignature = signature;
-      applyRestaurantUpdate(state.restaurants, state.reviews);
+      const byRestaurantId = Object.fromEntries(state.restaurants.map((restaurant) => [restaurant.id, restaurant]));
+      const reviewTransactions = state.reviews
+        .map((review) => {
+          const restaurant = byRestaurantId[review.restaurantId];
+          return restaurant ? transactionPayload(encodeRestaurantReviewTxn(restaurant, review)) : null;
+        })
+        .filter(Boolean);
+      if (!reviewTransactions.length) return;
+      applyRestaurantMutation(state.restaurants, state.reviews, {
+        action: "appendTransactions",
+        transactions: reviewTransactions,
+        memberDeltas: [],
+      });
     }, 500);
   }
 
@@ -323,6 +345,8 @@
       reviews,
       sourceTransactionCount: transactions.length,
       sourceReviewTransactionCount: reviewTransactions.length,
+      capabilities: Array.isArray(data.capabilities) ? data.capabilities.map(String) : [],
+      backendVersion: String(data.backendVersion || ""),
     };
   }
 
@@ -367,20 +391,22 @@
     throw new Error(errors.join(" / "));
   }
 
-  async function saveLedger(members, transactions, restaurants = state.restaurants, reviews = state.reviews) {
+  async function postLedgerMutation(payload) {
     if (state.remoteLedgerMissing && !state.canRestoreFromCache) {
       throw new Error("구글 시트 거래 기록이 리뷰 데이터만 남은 상태라 저장을 중단했습니다. 먼저 구글 시트 버전 기록이나 다른 브라우저 캐시로 복구해 주세요.");
     }
-    const storedTransactions = withRestaurantReviewTransactions(transactions, restaurants, reviews);
-    const payload = JSON.stringify({ action: "saveAll", members, transactions: storedTransactions, restaurants, reviews });
-    saveCache({ members, transactions, restaurants, reviews });
+    const action = String(payload.action || "saveAll");
+    if (MUTATION_ACTIONS.has(action) && !state.backendSupportsMutations) {
+      throw new Error("구글 Apps Script가 아직 행 단위 저장을 지원하지 않아 저장을 중단했습니다. apps-script/Code.gs로 웹 앱을 먼저 업데이트해 주세요.");
+    }
+    const body = JSON.stringify(payload);
 
     if (isLocalHttp()) {
       try {
         const response = await fetch("/api/save", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: payload,
+          body,
         });
         if (!response.ok) {
           throw new Error(`${response.status} ${response.statusText}`.trim());
@@ -394,9 +420,46 @@
     await fetch(SCRIPT_URL, {
       method: "POST",
       mode: "no-cors",
-      body: payload,
+      body,
     });
     return { verified: false };
+  }
+
+  async function saveLedgerSnapshot(members, transactions, restaurants = state.restaurants, reviews = state.reviews) {
+    const storedTransactions = withRestaurantReviewTransactions(transactions, restaurants, reviews);
+    saveCache({ members, transactions, restaurants, reviews });
+    return postLedgerMutation({ action: "saveAll", members, transactions: storedTransactions, restaurants, reviews });
+  }
+
+  function transactionPayload(txn) {
+    return {
+      ...txn,
+      memberIds: Array.isArray(txn.memberIds) ? txn.memberIds : String(txn.memberIds || "").split(",").filter(Boolean),
+      participants: normalizeParticipants(txn.participants),
+    };
+  }
+
+  function memberDeltasFromChanges(changes) {
+    const totals = new Map();
+    changes.forEach((change) => {
+      if (!change.memberId) return;
+      totals.set(change.memberId, (totals.get(change.memberId) || 0) + (Number(change.delta) || 0));
+    });
+    return [...totals.entries()].map(([memberId, delta]) => ({ memberId, delta }));
+  }
+
+  function memberDeltasForTransaction(txn) {
+    return memberDeltasFromChanges(computeChanges(txn));
+  }
+
+  function memberDeltasBetweenTransactions(original, edited) {
+    const oldTotals = changeTotalsByMember(original);
+    const newTotals = changeTotalsByMember(edited);
+    const ids = new Set([...oldTotals.keys(), ...newTotals.keys()]);
+    return [...ids].map((memberId) => ({
+      memberId,
+      delta: (newTotals.get(memberId) || 0) - (oldTotals.get(memberId) || 0),
+    })).filter((item) => item.delta);
   }
 
   async function loadLedger() {
@@ -437,6 +500,7 @@
       state.reviewsNeedSync = !remoteReviews.length && cachedReviews.length > 0;
       state.remoteLedgerMissing = remoteHasOnlyReviewRows;
       state.canRestoreFromCache = remoteHasOnlyReviewRows && cachedTransactions.length > 0;
+      state.backendSupportsMutations = result.data.capabilities.includes("appendTransaction");
       state.status = "ok";
       state.statusDetail = result.source === "/api/ledger" ? "로컬 프록시로 연결됨" : "구글 시트 연결됨";
       state.lastSynced = new Date();
@@ -461,7 +525,7 @@
     render();
   }
 
-  async function applyUpdate(members, transactions, afterSuccess) {
+  async function applySnapshotUpdate(members, transactions, afterSuccess) {
     state.members = members;
     state.transactions = transactions;
     state.saving = true;
@@ -471,7 +535,7 @@
     render();
 
     try {
-      const result = await saveLedger(members, transactions);
+      const result = await saveLedgerSnapshot(members, transactions);
       afterSuccess?.();
       state.status = result.verified ? "ok" : "sent";
       state.statusDetail = result.verified ? "구글 시트에 저장됨" : "저장 요청 전송됨";
@@ -488,7 +552,35 @@
     }
   }
 
-  async function applyRestaurantUpdate(restaurants, reviews, afterSuccess) {
+  async function applyTargetedUpdate({ members, transactions, payload, afterSuccess }) {
+    state.members = members;
+    state.transactions = transactions;
+    state.saving = true;
+    state.status = "saving";
+    state.statusDetail = "저장 중";
+    state.error = "";
+    saveCache({ members, transactions, restaurants: state.restaurants, reviews: state.reviews });
+    render();
+
+    try {
+      const result = await postLedgerMutation(payload);
+      afterSuccess?.();
+      state.status = result.verified ? "ok" : "sent";
+      state.statusDetail = result.verified ? "구글 시트에 저장됨" : "저장 요청 전송됨";
+      state.lastSynced = new Date();
+      state.remoteLedgerMissing = false;
+      state.canRestoreFromCache = false;
+    } catch (error) {
+      state.status = "error";
+      state.statusDetail = "저장 실패";
+      state.error = error.message || "저장하지 못했습니다.";
+    } finally {
+      state.saving = false;
+      render();
+    }
+  }
+
+  async function applyRestaurantMutation(restaurants, reviews, payload, afterSuccess) {
     state.restaurants = restaurants;
     state.reviews = reviews;
     state.saving = true;
@@ -496,10 +588,11 @@
     state.statusDetail = "저장 중";
     state.reviewStoreStatus = "식당 리뷰 저장 중";
     state.error = "";
+    saveCache({ members: state.members, transactions: state.transactions, restaurants, reviews });
     render();
 
     try {
-      const result = await saveLedger(state.members, state.transactions, restaurants, reviews);
+      const result = await postLedgerMutation(payload);
       afterSuccess?.();
       state.status = result.verified ? "ok" : "sent";
       state.statusDetail = result.verified ? "구글 시트에 저장됨" : "저장 요청 전송됨";
@@ -1290,7 +1383,12 @@
       createdAt: new Date().toISOString(),
     };
 
-    await applyRestaurantUpdate(restaurants, [review, ...state.reviews], () => {
+    const reviewTxn = encodeRestaurantReviewTxn(restaurant, review);
+    await applyRestaurantMutation(restaurants, [review, ...state.reviews], {
+      action: "appendTransaction",
+      transaction: transactionPayload(reviewTxn),
+      memberDeltas: [],
+    }, () => {
       form.restaurant.comment = "";
       form.restaurant.rating = "5";
     });
@@ -1300,7 +1398,11 @@
     const review = state.reviews.find((item) => item.id === reviewId);
     if (!review) return;
     if (!window.confirm("이 식당 리뷰를 삭제할까요?")) return;
-    await applyRestaurantUpdate(state.restaurants, state.reviews.filter((item) => item.id !== reviewId));
+    await applyRestaurantMutation(state.restaurants, state.reviews.filter((item) => item.id !== reviewId), {
+      action: "deleteTransaction",
+      transactionId: `review-${review.id}`,
+      memberDeltas: [],
+    });
   }
 
   function renderHistoryTab() {
@@ -1784,8 +1886,17 @@
         sharedAmount: 0,
         participants: [],
       };
-      await applyUpdate(members, [txn, ...state.transactions], () => {
-        form[type] = { memberId: "", amount: "", memo: "" };
+      await applyTargetedUpdate({
+        members,
+        transactions: [txn, ...state.transactions],
+        payload: {
+          action: "appendTransaction",
+          transaction: transactionPayload(txn),
+          memberDeltas: memberDeltasForTransaction(txn),
+        },
+        afterSuccess: () => {
+          form[type] = { memberId: "", amount: "", memo: "" };
+        },
       });
       return;
     }
@@ -1813,8 +1924,17 @@
         sharedAmount: 0,
         participants: [],
       };
-      await applyUpdate(members, [txn, ...state.transactions], () => {
-        form.shared = { memberIds: [], amount: "", memo: "" };
+      await applyTargetedUpdate({
+        members,
+        transactions: [txn, ...state.transactions],
+        payload: {
+          action: "appendTransaction",
+          transaction: transactionPayload(txn),
+          memberDeltas: memberDeltasForTransaction(txn),
+        },
+        afterSuccess: () => {
+          form.shared = { memberIds: [], amount: "", memo: "" };
+        },
       });
       return;
     }
@@ -1845,8 +1965,17 @@
         sharedAmount: 0,
         participants: [],
       };
-      await applyUpdate(members, [txn, ...state.transactions], () => {
-        form.transfer = { fromMemberId: "", toMemberId: "", amount: "", memo: "" };
+      await applyTargetedUpdate({
+        members,
+        transactions: [txn, ...state.transactions],
+        payload: {
+          action: "appendTransaction",
+          transaction: transactionPayload(txn),
+          memberDeltas: memberDeltasForTransaction(txn),
+        },
+        afterSuccess: () => {
+          form.transfer = { fromMemberId: "", toMemberId: "", amount: "", memo: "" };
+        },
       });
       return;
     }
@@ -1875,8 +2004,17 @@
       sharedAmount,
       participants: current.memberIds.map((id) => ({ id, amount: parseMoney(current.amounts[id]) })),
     };
-    await applyUpdate(members, [txn, ...state.transactions], () => {
-      form.delivery = { memberIds: [], amounts: {}, sharedAmount: "", payerId: "lab", memo: "" };
+    await applyTargetedUpdate({
+      members,
+      transactions: [txn, ...state.transactions],
+      payload: {
+        action: "appendTransaction",
+        transaction: transactionPayload(txn),
+        memberDeltas: memberDeltasForTransaction(txn),
+      },
+      afterSuccess: () => {
+        form.delivery = { memberIds: [], amounts: {}, sharedAmount: "", payerId: "lab", memo: "" };
+      },
     });
   }
 
@@ -1957,16 +2095,25 @@
     });
     const transactions = state.transactions.map((txn) => txn.id === original.id ? edited : txn);
 
-    await applyUpdate(members, transactions, () => {
-      state.modal = null;
-      resetEditTxnForm();
+    await applyTargetedUpdate({
+      members,
+      transactions,
+      payload: {
+        action: "updateTransaction",
+        transaction: transactionPayload(edited),
+        memberDeltas: memberDeltasBetweenTransactions(original, edited),
+      },
+      afterSuccess: () => {
+        state.modal = null;
+        resetEditTxnForm();
+      },
     });
   }
 
   async function restoreCachedTransactions() {
     if (!state.canRestoreFromCache || !state.transactions.length) return setStatusError("복구할 캐시 거래내역이 없습니다.");
     if (!window.confirm("이 브라우저에 남아 있는 캐시 거래내역으로 구글 시트를 복구할까요?")) return;
-    await applyUpdate(state.members, state.transactions);
+    await applySnapshotUpdate(state.members, state.transactions);
   }
 
   function downloadCacheBackup() {
@@ -2147,19 +2294,33 @@
     const name = form.member.name.trim();
     if (!name) return setStatusError("추가할 멤버 이름을 입력해 주세요.");
     const balance = parseMoney(form.member.balance);
-    const members = [...state.members, { id: uid(), name, balance }];
-    await applyUpdate(members, state.transactions, () => {
-      form.member = { name: "", balance: "50000" };
+    const member = { id: uid(), name, balance };
+    const members = [...state.members, member];
+    await applyTargetedUpdate({
+      members,
+      transactions: state.transactions,
+      payload: { action: "addMember", member },
+      afterSuccess: () => {
+        form.member = { name: "", balance: "50000" };
+      },
     });
   }
 
   async function saveMemberEdit(id) {
     syncInputs();
     const balance = parseMoney(form.editBalance);
-    const members = state.members.map((member) => member.id === id ? { ...member, balance } : member);
-    await applyUpdate(members, state.transactions, () => {
-      form.editMemberId = "";
-      form.editBalance = "";
+    const member = state.members.find((item) => item.id === id);
+    if (!member) return setStatusError("수정할 멤버를 찾지 못했습니다.");
+    const updated = { ...member, balance };
+    const members = state.members.map((item) => item.id === id ? updated : item);
+    await applyTargetedUpdate({
+      members,
+      transactions: state.transactions,
+      payload: { action: "updateMember", member: updated },
+      afterSuccess: () => {
+        form.editMemberId = "";
+        form.editBalance = "";
+      },
     });
   }
 
@@ -2177,12 +2338,24 @@
         return change ? { ...member, balance: member.balance - change.delta } : member;
       });
       const transactions = state.transactions.filter((item) => item.id !== modal.id);
-      await applyUpdate(members, transactions);
+      await applyTargetedUpdate({
+        members,
+        transactions,
+        payload: {
+          action: "deleteTransaction",
+          transactionId: txn.id,
+          memberDeltas: memberDeltasFromChanges(changes.map((change) => ({ ...change, delta: -change.delta }))),
+        },
+      });
       return;
     }
 
     const members = state.members.filter((member) => member.id !== modal.id);
-    await applyUpdate(members, state.transactions);
+    await applyTargetedUpdate({
+      members,
+      transactions: state.transactions,
+      payload: { action: "deleteMember", memberId: modal.id },
+    });
   }
 
   app.addEventListener("click", handleClick);
