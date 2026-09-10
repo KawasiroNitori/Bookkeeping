@@ -9,7 +9,9 @@
   const REVIEW_TXN_TYPE = "restaurantReview";
   const REVIEW_TXN_PREFIX = "__restaurant_review__:";
   const REVIEW_TXN_OFFSET_PREFIX = "__restaurant_review_offset__:";
+  const REQUIRED_SCHEMA_VERSION = "flat-member-columns-v1";
   const MUTATION_ACTIONS = new Set([
+    "saveAll",
     "appendTransaction",
     "appendTransactions",
     "updateTransaction",
@@ -33,6 +35,7 @@
     lastSynced: null,
     txType: "delivery",
     historyFilter: "all",
+    historySort: "desc",
     expandedTxnId: "",
     expandedMemberId: "",
     selectedRestaurantId: "",
@@ -48,6 +51,7 @@
   };
 
   const form = {
+    entry: { transactionDate: todayInputDate() },
     deposit: { memberId: "", amount: "", memo: "" },
     withdraw: { memberId: "", amount: "", memo: "" },
     shared: { memberIds: [], amount: "", memo: "" },
@@ -61,6 +65,7 @@
       id: "",
       type: "",
       date: "",
+      transactionDate: "",
       memberId: "",
       amount: "",
       memo: "",
@@ -115,6 +120,33 @@
     const cleaned = String(value ?? "").replace(/[^\d.-]/g, "");
     const num = Number(cleaned);
     return Number.isFinite(num) ? num : 0;
+  }
+
+  function todayInputDate() {
+    const date = new Date();
+    date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+    return date.toISOString().slice(0, 10);
+  }
+
+  function dateOnly(value) {
+    const text = String(value || "");
+    const match = text.match(/^\d{4}-\d{2}-\d{2}/);
+    if (match) return match[0];
+    const date = new Date(text);
+    return Number.isNaN(date.getTime()) ? todayInputDate() : date.toISOString().slice(0, 10);
+  }
+
+  function txnSortValue(txn) {
+    return `${txn.transactionDate || dateOnly(txn.date)}T${String(txn.createdAt || txn.date || "").slice(11, 19) || "00:00:00"}`;
+  }
+
+  function displayTxnDate(txn) {
+    const date = txn.transactionDate || dateOnly(txn.date);
+    const created = new Date(txn.createdAt || txn.date || date);
+    const time = Number.isNaN(created.getTime())
+      ? ""
+      : created.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
+    return time ? `${date} · ${time}` : date;
   }
 
   function uid() {
@@ -217,9 +249,12 @@
 
   function encodeRestaurantReviewTxn(restaurant, review) {
     const payload = JSON.stringify({ restaurant, review });
+    const createdAt = review.createdAt || new Date().toISOString();
     return {
       id: `review-${review.id}`,
-      date: review.createdAt || new Date().toISOString(),
+      date: createdAt,
+      createdAt,
+      transactionDate: dateOnly(createdAt),
       type: REVIEW_TXN_TYPE,
       amount: 0,
       memo: `${REVIEW_TXN_PREFIX}${payload}`,
@@ -309,7 +344,9 @@
     const transactions = (data.transactions || []).map((txn) => ({
       ...txn,
       id: String(txn.id || uid()),
-      date: txn.date || new Date().toISOString(),
+      transactionDate: dateOnly(txn.transactionDate || txn.date || txn.createdAt),
+      createdAt: txn.createdAt || txn.date || new Date().toISOString(),
+      date: txn.date || txn.createdAt || new Date().toISOString(),
       type: txn.type || "shared",
       amount: Number(txn.amount) || 0,
       amountPerPerson: Number(txn.amountPerPerson) || 0,
@@ -322,6 +359,9 @@
         ? txn.memberIds.map(String)
         : String(txn.memberIds || "").split(",").filter(Boolean),
       participants: normalizeParticipants(txn.participants),
+      memberDeltas: Array.isArray(txn.memberDeltas)
+        ? txn.memberDeltas.map((item) => ({ memberId: String(item.memberId || ""), delta: Number(item.delta) || 0 })).filter((item) => item.memberId && item.delta)
+        : [],
       memo: String(txn.memo || ""),
     }));
 
@@ -347,6 +387,7 @@
       sourceReviewTransactionCount: reviewTransactions.length,
       capabilities: Array.isArray(data.capabilities) ? data.capabilities.map(String) : [],
       backendVersion: String(data.backendVersion || ""),
+      schemaVersion: String(data.schemaVersion || ""),
     };
   }
 
@@ -434,8 +475,11 @@
   function transactionPayload(txn) {
     return {
       ...txn,
+      transactionDate: dateOnly(txn.transactionDate || txn.date || txn.createdAt),
+      createdAt: txn.createdAt || txn.date || new Date().toISOString(),
       memberIds: Array.isArray(txn.memberIds) ? txn.memberIds : String(txn.memberIds || "").split(",").filter(Boolean),
       participants: normalizeParticipants(txn.participants),
+      memberDeltas: memberDeltasForTransaction(txn),
     };
   }
 
@@ -500,7 +544,8 @@
       state.reviewsNeedSync = !remoteReviews.length && cachedReviews.length > 0;
       state.remoteLedgerMissing = remoteHasOnlyReviewRows;
       state.canRestoreFromCache = remoteHasOnlyReviewRows && cachedTransactions.length > 0;
-      state.backendSupportsMutations = result.data.capabilities.includes("appendTransaction");
+      state.backendSupportsMutations = result.data.schemaVersion === REQUIRED_SCHEMA_VERSION
+        && result.data.capabilities.includes("appendTransaction");
       state.status = "ok";
       state.statusDetail = result.source === "/api/ledger" ? "로컬 프록시로 연결됨" : "구글 시트 연결됨";
       state.lastSynced = new Date();
@@ -620,6 +665,9 @@
   }
 
   function computeChanges(txn) {
+    if (Array.isArray(txn.memberDeltas) && txn.memberDeltas.length) {
+      return memberDeltasFromChanges(txn.memberDeltas);
+    }
     switch (txn.type) {
       case "deposit":
         return [{ memberId: txn.memberId, delta: Number(txn.amount) || 0 }];
@@ -653,7 +701,7 @@
   function getMemberHistory(memberId, transactions, currentBalance) {
     const relevant = [];
     [...transactions]
-      .sort((a, b) => new Date(a.date) - new Date(b.date))
+      .sort((a, b) => txnSortValue(a).localeCompare(txnSortValue(b)))
       .forEach((txn) => {
         const change = computeChanges(txn).find((item) => item.memberId === memberId);
         if (change) {
@@ -668,6 +716,13 @@
       balance -= relevant[index].delta;
     }
     return result;
+  }
+
+  function sortedTransactions(transactions) {
+    return [...transactions].sort((a, b) => {
+      const comparison = txnSortValue(a).localeCompare(txnSortValue(b));
+      return state.historySort === "asc" ? comparison : -comparison;
+    });
   }
 
   function avatar(name, size = 38) {
@@ -842,6 +897,15 @@
     return renderDepositWithdrawForm(state.txType);
   }
 
+  function renderTransactionDateField() {
+    return `
+      <div class="field">
+        <label for="entry-transaction-date">거래 날짜</label>
+        <input id="entry-transaction-date" type="date" data-form="entry" data-field="transactionDate" value="${escapeHtml(form.entry.transactionDate || todayInputDate())}">
+      </div>
+    `;
+  }
+
   function memberChips(options) {
     const { selected = [], action = "select-member", group, disabledId = "" } = options;
     return state.members.map((member) => {
@@ -855,6 +919,7 @@
     const current = form[type];
     return `
       <form class="form-panel" data-form-root="${type}">
+        ${renderTransactionDateField()}
         <div class="field">
           <div class="field-label">대상 멤버</div>
           <div class="chips">${memberChips({ selected: current.memberId ? [current.memberId] : [], group: type })}</div>
@@ -884,6 +949,7 @@
 
     return `
       <form class="form-panel" data-form-root="shared">
+        ${renderTransactionDateField()}
         <div class="field">
           <div class="field-label">참여 멤버</div>
           <div class="chips">
@@ -917,6 +983,7 @@
 
     return `
       <form class="form-panel" data-form-root="transfer">
+        ${renderTransactionDateField()}
         <div class="field">
           <div class="field-label">보내는 사람</div>
           <div class="chips">${memberChips({ selected: current.fromMemberId ? [current.fromMemberId] : [], group: "transfer-from" })}</div>
@@ -951,6 +1018,7 @@
 
     return `
       <form class="form-panel" data-form-root="delivery">
+        ${renderTransactionDateField()}
         <div class="field">
           <div class="field-label">참여 멤버</div>
           <div class="chips">${memberChips({ selected: current.memberIds, group: "delivery" })}</div>
@@ -1414,14 +1482,17 @@
       ["shared", "공동"],
       ["delivery", "배달"],
     ];
-    const transactions = state.historyFilter === "all"
+    const filtered = state.historyFilter === "all"
       ? state.transactions
       : state.transactions.filter((txn) => txn.type === state.historyFilter);
+    const transactions = sortedTransactions(filtered);
 
     return `
       <section class="grid">
         <div class="chips">
           ${filters.map(([id, label]) => `<button class="chip ${state.historyFilter === id ? "active" : ""}" data-action="history-filter" data-filter="${id}">${label}</button>`).join("")}
+          <button class="chip ${state.historySort === "desc" ? "active" : ""}" data-action="history-sort" data-sort="desc">최신순</button>
+          <button class="chip ${state.historySort === "asc" ? "active" : ""}" data-action="history-sort" data-sort="asc">오래된순</button>
         </div>
         <div class="stack">
           ${transactions.length ? transactions.map(renderHistoryItem).join("") : `<div class="empty">거래 내역이 없습니다</div>`}
@@ -1454,7 +1525,7 @@
 
   function renderHistoryItem(txn) {
     const info = txnInfo(txn);
-    const date = new Date(txn.date).toLocaleString("ko-KR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const date = displayTxnDate(txn);
     const expanded = state.expandedTxnId === txn.id;
     return `
       <article class="card history-item">
@@ -1568,7 +1639,7 @@
     return `
       <div class="detail" style="margin:0 14px 14px">
         ${history.length ? history.map(({ txn, delta, balanceAfter }) => {
-          const date = new Date(txn.date).toLocaleString("ko-KR", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+          const date = displayTxnDate(txn);
           return `
             <div class="row" style="padding:7px 0;border-bottom:1px solid var(--line)">
               <div style="min-width:0">
@@ -1588,6 +1659,7 @@
       id: "",
       type: "",
       date: "",
+      transactionDate: "",
       memberId: "",
       amount: "",
       memo: "",
@@ -1605,6 +1677,7 @@
       id: txn.id,
       type: txn.type,
       date: txn.date,
+      transactionDate: txn.transactionDate || dateOnly(txn.date || txn.createdAt),
       memberId: txn.memberId || "",
       amount: String(Math.round(Number(txn.amount) || 0)),
       memo: txn.memo || "",
@@ -1739,6 +1812,10 @@
           <form class="edit-transaction-form" data-form-root="edit-txn">
             ${renderEditTransactionFields()}
             <div class="field">
+              <label for="edit-txn-date">거래 날짜</label>
+              <input id="edit-txn-date" type="date" data-form="editTxn" data-field="transactionDate" value="${escapeHtml(form.editTxn.transactionDate || todayInputDate())}">
+            </div>
+            <div class="field">
               <label for="edit-txn-memo">메모</label>
               <input id="edit-txn-memo" type="text" data-form="editTxn" data-field="memo" value="${escapeHtml(form.editTxn.memo)}" placeholder="내용을 입력하세요">
             </div>
@@ -1864,6 +1941,7 @@
     syncInputs();
     const type = state.txType;
     const now = new Date().toISOString();
+    const transactionDate = form.entry.transactionDate || todayInputDate();
 
     if (type === "deposit" || type === "withdraw") {
       const current = form[type];
@@ -1874,6 +1952,8 @@
       const txn = {
         id: uid(),
         date: now,
+        createdAt: now,
+        transactionDate,
         type,
         amount,
         memo: current.memo,
@@ -1912,6 +1992,8 @@
       const txn = {
         id: uid(),
         date: now,
+        createdAt: now,
+        transactionDate,
         type: "shared",
         amount,
         memo: current.memo,
@@ -1953,6 +2035,8 @@
       const txn = {
         id: uid(),
         date: now,
+        createdAt: now,
+        transactionDate,
         type: "transfer",
         amount,
         memo: current.memo,
@@ -1992,6 +2076,8 @@
     const txn = {
       id: uid(),
       date: now,
+      createdAt: now,
+      transactionDate,
       type: "delivery",
       amount: total,
       memo: current.memo,
@@ -2033,6 +2119,9 @@
     const base = {
       ...original,
       type,
+      transactionDate: current.transactionDate || original.transactionDate || dateOnly(original.date || original.createdAt),
+      createdAt: original.createdAt || original.date,
+      date: original.date || original.createdAt,
       memo: current.memo,
       memberId: "",
       memberIds: [],
@@ -2042,6 +2131,7 @@
       payerId: "",
       sharedAmount: 0,
       participants: [],
+      memberDeltas: [],
     };
 
     if (type === "deposit" || type === "withdraw") {
@@ -2250,6 +2340,10 @@
     }
     if (action === "history-filter") {
       state.historyFilter = button.dataset.filter;
+      return render();
+    }
+    if (action === "history-sort") {
+      state.historySort = button.dataset.sort === "asc" ? "asc" : "desc";
       return render();
     }
     if (action === "expand-txn") {
