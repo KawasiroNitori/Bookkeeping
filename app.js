@@ -688,10 +688,14 @@
         const sharedPer = participants.length ? (Number(txn.sharedAmount) || 0) / participants.length : 0;
         const total = Number(txn.amount) || 0;
         const payerId = txn.payerId && txn.payerId !== "lab" ? txn.payerId : "";
-        return participants.map((part) => {
+        const changes = participants.map((part) => {
           const cost = (Number(part.amount) || 0) + sharedPer;
           return { memberId: part.id, delta: -cost + (part.id === payerId ? total : 0) };
         });
+        if (payerId && !participants.some((part) => part.id === payerId)) {
+          changes.push({ memberId: payerId, delta: total });
+        }
+        return changes;
       }
       default:
         return [];
@@ -823,6 +827,11 @@
             <div class="metric-label">충전 필요</div>
             <div class="metric-value" style="color:${below.length ? "var(--bad)" : "var(--good)"}">${below.length}명</div>
           </div>
+        </div>
+
+        <div class="metric">
+          <div class="metric-label">계좌번호</div>
+          <div class="account-number">7942-07-74160</div>
         </div>
 
         <div>
@@ -1052,7 +1061,7 @@
           <div class="field-label">결제자</div>
           <div class="chips">
             <button class="chip ${current.payerId === "lab" ? "active" : ""}" data-action="payer" data-id="lab">랩비카드</button>
-            ${selectedMembers.map((member) => `<button class="chip ${current.payerId === member.id ? "active" : ""}" data-action="payer" data-id="${member.id}">${escapeHtml(member.name)}</button>`).join("")}
+            ${state.members.map((member) => `<button class="chip ${current.payerId === member.id ? "active" : ""}" type="button" data-action="payer" data-id="${member.id}">${escapeHtml(member.name)}</button>`).join("")}
           </div>
         </div>
         <div class="field">
@@ -1083,11 +1092,16 @@
     const sharedPer = participants.length ? sharedAmount / participants.length : 0;
     const total = participants.reduce((sum, item) => sum + item.individual, 0) + sharedAmount;
 
-    return participants.map((item) => {
+    const preview = participants.map((item) => {
       const cost = item.individual + sharedPer;
       const isPayer = current.payerId === item.id;
       return { ...item, cost, delta: -cost + (isPayer ? total : 0), isPayer };
     });
+    if (current.payerId !== "lab" && state.members.some((member) => member.id === current.payerId)
+      && !participants.some((item) => item.id === current.payerId)) {
+      preview.push({ id: current.payerId, individual: 0, cost: 0, delta: total, isPayer: true });
+    }
+    return preview;
   }
 
   function renderDeliveryPreview() {
@@ -1793,7 +1807,7 @@
           <div class="field-label">결제자</div>
           <div class="chips">
             <button class="chip ${current.payerId === "lab" ? "active" : ""}" type="button" data-action="edit-txn-payer" data-id="lab">랩비카드</button>
-            ${selectedMembers.map((member) => `<button class="chip ${current.payerId === member.id ? "active" : ""}" type="button" data-action="edit-txn-payer" data-id="${member.id}">${escapeHtml(member.name)}</button>`).join("")}
+            ${state.members.map((member) => `<button class="chip ${current.payerId === member.id ? "active" : ""}" type="button" data-action="edit-txn-payer" data-id="${member.id}">${escapeHtml(member.name)}</button>`).join("")}
           </div>
         </div>
       `;
@@ -2161,7 +2175,7 @@
       const participants = current.memberIds.map((id) => ({ id, amount: parseMoney(current.amounts[id]) }));
       const total = participants.reduce((sum, part) => sum + part.amount, 0) + sharedAmount;
       if (!participants.length || total <= 0) return setStatusError("배달정산 참여 멤버와 금액을 확인해 주세요.");
-      const payerId = current.payerId && (current.payerId === "lab" || current.memberIds.includes(current.payerId))
+      const payerId = current.payerId && (current.payerId === "lab" || state.members.some((member) => member.id === current.payerId))
         ? current.payerId
         : "lab";
       return { ...base, amount: total, payerId, sharedAmount, participants };
@@ -2260,7 +2274,6 @@
     } else if (group === "delivery") {
       form.editTxn.memberIds = toggleArrayValue(form.editTxn.memberIds, id);
       if (!form.editTxn.memberIds.includes(id)) delete form.editTxn.amounts[id];
-      if (!form.editTxn.memberIds.includes(form.editTxn.payerId)) form.editTxn.payerId = "lab";
     }
 
     render();
@@ -2303,7 +2316,6 @@
       } else if (group === "delivery") {
         form.delivery.memberIds = toggleArrayValue(form.delivery.memberIds, id);
         if (!form.delivery.memberIds.includes(id)) delete form.delivery.amounts[id];
-        if (!form.delivery.memberIds.includes(form.delivery.payerId)) form.delivery.payerId = "lab";
       }
       return render();
     }

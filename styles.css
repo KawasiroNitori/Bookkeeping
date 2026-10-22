@@ -259,6 +259,13 @@ textarea {
   letter-spacing: 0.03em;
 }
 
+.account-number {
+  margin-top: 7px;
+  font-size: 24px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
 .metric-value {
   margin-top: 7px;
   font-size: clamp(24px, 4vw, 38px);
