@@ -409,11 +409,25 @@
   }
 
   async function fetchJson(url) {
-    const response = await fetch(url, { cache: "no-store" });
-    if (!response.ok) {
-      throw new Error(`${response.status} ${response.statusText}`.trim());
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 25000);
+      let retryable = true;
+      try {
+        const response = await fetch(url, { cache: "no-store", signal: controller.signal });
+        if (!response.ok) {
+          retryable = [404, 408, 429].includes(response.status) || response.status >= 500;
+          throw new Error(`${response.status} ${response.statusText}`.trim());
+        }
+        retryable = false;
+        return await response.json();
+      } catch (error) {
+        if (!retryable || attempt === 2) throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
     }
-    return response.json();
   }
 
   async function fetchLedger() {
